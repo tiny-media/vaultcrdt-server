@@ -1,5 +1,5 @@
 # ── Stage 1: base with Rust + cargo-chef ────────────────────────────────────
-FROM rust:1.94.1-alpine3.23 AS chef
+FROM rust:1.95.0-alpine3.23 AS chef
 RUN apk add --no-cache musl-dev && cargo install cargo-chef --locked
 WORKDIR /app
 
