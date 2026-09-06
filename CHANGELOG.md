@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-09-06
+
+### Changed
+
+- Loro 1.13.9 -> 1.16.0 (lockstep with the plugin): atomic imports with
+  rollback (a failed import no longer detaches a document), concurrent
+  updates to shallow roots reject instead of panicking, faster
+  out-of-order imports, bounded decoded-value cache.
+- sqlx -> rusqlite 0.40.2 (bundled SQLite 3.53.2): one connection per
+  process (structurally avoids the multi-connection WAL race class),
+  migrations via user_version with one-shot adoption of existing sqlx
+  migration state, dependency count 321 -> 263.
+- Toolchain 1.98.1 (toolchain + CI); Docker image deliberately stays
+  rust:1.95.0-alpine3.23 until a 1.98.1-alpine tag exists (1.98.0
+  carries a vtable miscompilation).
+- Dependency refresh (axum 0.8.9, tokio 1.53.1 and patch lines);
+  compose gains init: true and stop_grace_period 20s.
+
+
 ## [0.3.1] - 2026-09-06
 
 ### Added

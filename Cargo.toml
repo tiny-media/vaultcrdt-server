@@ -10,7 +10,7 @@ repository = "https://github.com/tiny-media/vaultcrdt-server"
 
 [package]
 name = "vaultcrdt-server"
-version = "0.3.1"
+version = "0.3.2"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
