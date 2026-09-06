@@ -164,7 +164,7 @@ async fn check_auth_rate_limit(
     // not forgeable through it — use it only when the operator declared a
     // trusted proxy via VAULTCRDT_TRUST_PROXY, else key by the socket
     // address. Key length is capped in the limiter.
-    // ponytail: a non-Cloudflare proxy chain would need its own header
+    // note: a non-Cloudflare proxy chain would need its own header
     // decision; upgrade path = configurable header extraction.
     let key = if state.trust_proxy {
         headers

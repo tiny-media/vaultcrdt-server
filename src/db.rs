@@ -16,7 +16,7 @@ const INVALID_VV_SENTINEL_JSON: &[u8] = b"__vaultcrdt_invalid_vv__";
 /// synchronously — SQLite operations here are microseconds to low
 /// milliseconds, so briefly occupying the executor thread is acceptable at
 /// friends/family scale.
-/// ponytail: ceiling = a single writer/reader under contention. Upgrade path =
+/// note: ceiling = a single writer/reader under contention. Upgrade path =
 /// a dedicated connection thread (actor) or a small pool — measure first.
 #[derive(Clone)]
 pub struct Db(Arc<Mutex<Connection>>);
@@ -28,7 +28,7 @@ impl Db {
 }
 
 /// Migrations are compiled in; the `migrations/` directory stays the source of
-/// truth. ponytail: three `include_str!` lines beat pulling in `include_dir`
+/// truth. note: three `include_str!` lines beat pulling in `include_dir`
 /// via the `from-directory` feature; switch when migrations get numerous.
 fn migrations() -> Migrations<'static> {
     Migrations::new(vec![

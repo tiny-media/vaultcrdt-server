@@ -124,7 +124,7 @@ async fn main() {
     let mut raw = std::env::args();
     // The binary name (argv[0]) is not part of the invocation contract.
     let _ = raw.next();
-    // ponytail: hand-rolled dispatch; upgrade to clap when a 4th command or
+    // note: hand-rolled dispatch; upgrade to clap when a 4th command or
     // nested flags arrive.
     match cli::parse_invocation(raw) {
         Invocation::Cli(args) => std::process::exit(run_cli(args).await),
