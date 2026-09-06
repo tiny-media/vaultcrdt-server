@@ -28,7 +28,7 @@ axum            = { version = "0.8", features = ["ws"] }
 sqlx            = { version = "0.9", features = ["runtime-tokio", "sqlite", "migrate"] }
 libsqlite3-sys  = { version = "0.37", features = ["bundled"] }
 jsonwebtoken    = { version = "11.0.0", default-features = false, features = ["rust_crypto"] }
-loro            = "1.13"
+loro            = "=1.16.0"
 rmp-serde       = "1"
 serde           = { version = "1", features = ["derive"] }
 serde_bytes     = "0.11"
