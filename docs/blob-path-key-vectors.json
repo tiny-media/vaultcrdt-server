@@ -1,0 +1,86 @@
+{
+  "key_version": 1,
+  "unicode_version": "17.0.0",
+  "vectors": [
+    {
+      "input": "Bilder/\u00dcbersicht.PNG",
+      "key": "bilder/\u00fcbersicht.png"
+    },
+    {
+      "input": "Bilder/U\u0308bersicht.png",
+      "key": "bilder/\u00fcbersicht.png"
+    },
+    {
+      "input": "Notes/Stra\u00dfe.pdf",
+      "key": "notes/strasse.pdf"
+    },
+    {
+      "input": "Notes/STRASSE.pdf",
+      "key": "notes/strasse.pdf"
+    },
+    {
+      "input": "\u0130stanbul.jpg",
+      "key": "i\u0307stanbul.jpg"
+    },
+    {
+      "input": "Istanbul.jpg",
+      "key": "istanbul.jpg"
+    },
+    {
+      "input": "\u0131l\u0131k.jpg",
+      "key": "\u0131l\u0131k.jpg"
+    },
+    {
+      "input": "\u039f\u0394\u03a5\u03a3\u03a3\u0395\u03a5\u03a3.webp",
+      "key": "\u03bf\u03b4\u03c5\u03c3\u03c3\u03b5\u03c5\u03c3.webp"
+    },
+    {
+      "input": "family \ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\u200d\ud83d\udc66.heic",
+      "key": "family \ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\u200d\ud83d\udc66.heic"
+    },
+    {
+      "input": "\uff21\uff42\uff43.png",
+      "key": "\uff41\uff42\uff43.png"
+    },
+    {
+      "input": "abc.png",
+      "key": "abc.png"
+    },
+    {
+      "input": "../x.png",
+      "key": null
+    },
+    {
+      "input": "/x.png",
+      "key": null
+    },
+    {
+      "input": "a//b.png",
+      "key": null
+    },
+    {
+      "input": "x.svg",
+      "key": null
+    },
+    {
+      "input": "foo.png ",
+      "key": null
+    },
+    {
+      "input": "a./x.png",
+      "key": null
+    },
+    {
+      "input": ".obsidian/a.png",
+      "key": null
+    },
+    {
+      "input": "a/b/../c.png",
+      "key": null
+    },
+    {
+      "input": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.png",
+      "key": null
+    }
+  ]
+}

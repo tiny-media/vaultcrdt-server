@@ -1,0 +1,14 @@
+target/
+data/
+.env
+*.db
+*.db-wal
+*.db-shm
+# Agent/setup runtime (v0.5)
+.pi-subagents/
+thoughts/shared/
+**/.DS_Store
+**/._*
+
+# v0.5 stable setup runtime
+_setup/_work/

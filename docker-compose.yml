@@ -1,0 +1,20 @@
+services:
+  server:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "3737:8080"
+    volumes:
+      - ./data:/var/lib/vaultcrdt
+    environment:
+      VAULTCRDT_DB_PATH: /var/lib/vaultcrdt/data.db
+      VAULTCRDT_BIND: 0.0.0.0:8080
+      # These MUST be provided via .env or the shell environment.
+      # `docker compose up` will fail fast if either is unset or empty.
+      VAULTCRDT_JWT_SECRET: ${VAULTCRDT_JWT_SECRET:?VAULTCRDT_JWT_SECRET must be set (see .env.example)}
+      VAULTCRDT_ADMIN_TOKEN: ${VAULTCRDT_ADMIN_TOKEN:?VAULTCRDT_ADMIN_TOKEN must be set (see .env.example)}
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
