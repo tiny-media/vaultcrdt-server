@@ -1,7 +1,7 @@
 //! Operator CLI: vault create/list, invite mint. Runs against the same DB as
 //! the server; no auth (container exec is the trust boundary).
+use crate::db::Db;
 use crate::{db, invites, valid_vault_id};
-use sqlx::SqlitePool;
 use std::io::Write;
 
 pub const USAGE: &str = "\
@@ -115,12 +115,7 @@ fn kv(out: &mut dyn Write, width: usize, key: &str, value: &str) {
 }
 
 /// `args` excludes the program name: args[0] is the command.
-pub async fn run(
-    pool: &SqlitePool,
-    args: &[String],
-    out: &mut dyn Write,
-    err: &mut dyn Write,
-) -> i32 {
+pub async fn run(db: &Db, args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     match args.first().map(String::as_str) {
         Some("help" | "--help" | "-h") => {
             let _ = write!(out, "{USAGE}");
@@ -136,7 +131,7 @@ pub async fn run(
     match (args[0].as_str(), sub, p.positionals.len()) {
         ("vault", Some("create"), 2) => {
             vault_create(
-                pool,
+                db,
                 &p.positionals[1],
                 p.server_url.as_deref(),
                 p.json,
@@ -145,10 +140,10 @@ pub async fn run(
             )
             .await
         }
-        ("vault", Some("list"), 1) => vault_list(pool, p.json, out, err).await,
+        ("vault", Some("list"), 1) => vault_list(db, p.json, out, err).await,
         ("invite", Some("mint"), 2) => {
             invite_mint(
-                pool,
+                db,
                 &p.positionals[1],
                 p.server_url.as_deref(),
                 p.json,
@@ -172,7 +167,7 @@ fn runtime_error(err: &mut dyn Write, e: impl std::fmt::Display) -> i32 {
 }
 
 async fn vault_create(
-    pool: &SqlitePool,
+    db: &Db,
     name: &str,
     server_url: Option<&str>,
     json: bool,
@@ -182,7 +177,7 @@ async fn vault_create(
     if !valid_vault_id(name) {
         return usage(err);
     }
-    match db::vault_exists(pool, name).await {
+    match db::vault_exists(db, name).await {
         Ok(true) => {
             let _ = writeln!(err, "vault exists: {name}");
             return 3;
@@ -195,7 +190,7 @@ async fn vault_create(
         b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
     );
     // Lost race: the stored secret is not the one we generated — never print it.
-    match db::create_vault(pool, name, &secret).await {
+    match db::create_vault(db, name, &secret).await {
         Ok(true) => {}
         Ok(false) => {
             let _ = writeln!(err, "vault exists: {name}");
@@ -231,13 +226,8 @@ async fn vault_create(
     0
 }
 
-async fn vault_list(
-    pool: &SqlitePool,
-    json: bool,
-    out: &mut dyn Write,
-    err: &mut dyn Write,
-) -> i32 {
-    let vaults = match db::list_vaults(pool).await {
+async fn vault_list(db: &Db, json: bool, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    let vaults = match db::list_vaults(db).await {
         Ok(v) => v,
         Err(e) => return runtime_error(err, e),
     };
@@ -257,7 +247,7 @@ async fn vault_list(
 }
 
 async fn invite_mint(
-    pool: &SqlitePool,
+    db: &Db,
     vault: &str,
     server_url: Option<&str>,
     json: bool,
@@ -268,7 +258,7 @@ async fn invite_mint(
         return usage(err);
     }
     // invites has no FK to vaults — check here or mint a dangling invite.
-    match db::vault_exists(pool, vault).await {
+    match db::vault_exists(db, vault).await {
         Ok(true) => {}
         Ok(false) => {
             let _ = writeln!(err, "vault not found: {vault}");
@@ -276,7 +266,7 @@ async fn invite_mint(
         }
         Err(e) => return runtime_error(err, e),
     }
-    let (invite, expires_at) = match invites::mint_invite(pool, vault, "operator-cli", None).await {
+    let (invite, expires_at) = match invites::mint_invite(db, vault, "operator-cli", None).await {
         Ok(v) => v,
         Err(e) => return runtime_error(err, e),
     };

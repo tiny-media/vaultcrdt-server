@@ -1,4 +1,4 @@
-use super::{test_pool, test_state};
+use super::{exec, scalar, test_db, test_state};
 use crate::{AppState, auth, build_router};
 use axum::{
     body::{Body, to_bytes},
@@ -52,7 +52,7 @@ async fn invite(state: &AppState, vault: &str) -> String {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
     );
-    let ttl: i64 = sqlx::query_scalar("SELECT unixepoch(expires_at) - unixepoch(created_at) FROM invites ORDER BY id DESC LIMIT 1").fetch_one(&state.pool).await.unwrap();
+    let ttl: i64 = scalar(&state.db, "SELECT unixepoch(expires_at) - unixepoch(created_at) FROM invites ORDER BY id DESC LIMIT 1").await;
     assert_eq!(ttl, 900);
     token.to_owned()
 }
@@ -70,7 +70,7 @@ async fn redeem(state: &AppState, token: &str, peer: &str) -> (StatusCode, Value
 
 #[tokio::test]
 async fn invite_errors_and_features() {
-    let state = test_state(test_pool().await);
+    let state = test_state(test_db().await);
     let (status, body) = call(&state, "GET", "/health", json!(null), None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["features"], json!(["invite", "device_keys"]));
@@ -85,10 +85,11 @@ async fn invite_errors_and_features() {
         (StatusCode::UNAUTHORIZED, json!({"error":"invalid invite"}))
     );
     let token = invite(&state, "vault-a").await;
-    sqlx::query("UPDATE invites SET expires_at = datetime('now', '-1 second')")
-        .execute(&state.pool)
-        .await
-        .unwrap();
+    exec(
+        &state.db,
+        "UPDATE invites SET expires_at = datetime('now', '-1 second')",
+    )
+    .await;
     assert_eq!(
         redeem(&state, &token, "x").await,
         (StatusCode::GONE, json!({"error":"invite expired"}))
@@ -103,7 +104,7 @@ async fn invite_errors_and_features() {
 
 #[tokio::test]
 async fn device_auth_hashes_and_retirement() {
-    let state = test_state(test_pool().await);
+    let state = test_state(test_db().await);
     let token = invite(&state, "vault-a").await;
     let (status, body) = redeem(&state, &token, "joining").await;
     assert_eq!(status, StatusCode::OK);
@@ -114,10 +115,7 @@ async fn device_auth_hashes_and_retirement() {
         auth::jwt_verify(body["token"].as_str().unwrap(), &state.jwt_secret).unwrap(),
         "vault-a"
     );
-    let stored: String = sqlx::query_scalar("SELECT token_hash FROM invites")
-        .fetch_one(&state.pool)
-        .await
-        .unwrap();
+    let stored: String = scalar(&state.db, "SELECT token_hash FROM invites").await;
     assert_ne!(stored, token);
     // Invite tokens are high-entropy random values: stored as SHA-256 hex
     // (64 chars), not argon2 — argon2 on the redeem scan was a CPU DoS
@@ -128,10 +126,7 @@ async fn device_auth_hashes_and_retirement() {
     let mut h = Sha256::new();
     h.update(token.as_bytes());
     assert_eq!(stored, format!("{:x}", h.finalize()));
-    let stored: String = sqlx::query_scalar("SELECT key_hash FROM device_keys")
-        .fetch_one(&state.pool)
-        .await
-        .unwrap();
+    let stored: String = scalar(&state.db, "SELECT key_hash FROM device_keys").await;
     assert_ne!(stored, key);
     assert!(stored.starts_with("$argon2"));
     assert!(crate::db::verify_secret(key, &stored));
@@ -155,12 +150,11 @@ async fn device_auth_hashes_and_retirement() {
             )
         );
     }
-    sqlx::query(
+    exec(
+        &state.db,
         "INSERT INTO peers (vault_id, peer_id, device_name) VALUES ('vault-a', 'joining', 'Phone')",
     )
-    .execute(&state.pool)
-    .await
-    .unwrap();
+    .await;
     // Rejected confirmation must not revoke a key.
     assert_eq!(
         call(
@@ -174,10 +168,7 @@ async fn device_auth_hashes_and_retirement() {
         .0,
         StatusCode::CONFLICT
     );
-    let revoked: Option<String> = sqlx::query_scalar("SELECT revoked_at FROM device_keys")
-        .fetch_one(&state.pool)
-        .await
-        .unwrap();
+    let revoked: Option<String> = scalar(&state.db, "SELECT revoked_at FROM device_keys").await;
     assert!(revoked.is_none());
     assert_eq!(
         call(
@@ -191,10 +182,7 @@ async fn device_auth_hashes_and_retirement() {
         .0,
         StatusCode::OK
     );
-    let revoked: Option<String> = sqlx::query_scalar("SELECT revoked_at FROM device_keys")
-        .fetch_one(&state.pool)
-        .await
-        .unwrap();
+    let revoked: Option<String> = scalar(&state.db, "SELECT revoked_at FROM device_keys").await;
     assert!(revoked.is_some());
     assert_eq!(
         call(&state, "POST", "/auth/device", credentials, None).await,
@@ -207,30 +195,23 @@ async fn device_auth_hashes_and_retirement() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_redeem_has_one_winner() {
-    // A file-backed pool exercises independent SQLite connections and writer locks.
+    // A file-backed DB exercises the real on-disk write path and its locking.
     let path = std::env::temp_dir().join(format!("vault-invite-{}.db", uuid::Uuid::new_v4()));
-    let state = test_state(
-        crate::db::create_pool(path.to_str().unwrap())
-            .await
-            .unwrap(),
-    );
+    let state = test_state(crate::db::open_db(path.to_str().unwrap()).await.unwrap());
     let token = invite(&state, "vault-a").await;
     let (a, b) = tokio::join!(redeem(&state, &token, "a"), redeem(&state, &token, "b"));
     let mut statuses = [a.0.as_u16(), b.0.as_u16()];
     statuses.sort();
     assert_eq!(statuses, [200, 409]);
-    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM device_keys")
-        .fetch_one(&state.pool)
-        .await
-        .unwrap();
+    let count: i64 = scalar(&state.db, "SELECT count(*) FROM device_keys").await;
     assert_eq!(count, 1);
-    state.pool.close().await;
+    drop(state);
     std::fs::remove_file(path).unwrap();
 }
 
 #[tokio::test]
 async fn onboarding_shares_auth_rate_limit() {
-    let state = test_state(test_pool().await);
+    let state = test_state(test_db().await);
     for _ in 0..10 {
         assert_eq!(
             redeem(&state, "AAAAAAAAAAAAAAAAAAAAAA", "x").await.0,

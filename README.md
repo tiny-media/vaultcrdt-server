@@ -35,7 +35,6 @@ The server listens on port 8080 inside the container, mapped to `3737` on the ho
 | `VAULTCRDT_BIND` | no | `0.0.0.0:8080` | Address and port to listen on |
 | `VAULTCRDT_JWT_SECRET` | yes | — | Secret for signing JWT session tokens |
 | `VAULTCRDT_ADMIN_TOKEN` | yes | — | Admin token. Required for vault registration and admin endpoints. Not needed for the CLI. |
-| `VAULTCRDT_POOL_SIZE` | no | `5` | SQLite connection pool size |
 | `VAULTCRDT_TOMBSTONE_DAYS` | no | `365` | Days a tombstone is retained before expiry. Expiry is also blocked while a known peer has not been seen since that deletion. |
 | `VAULTCRDT_PEER_RETENTION_DAYS` | no | `365` | Days a peer entry is kept after its last connection. After this period the peer no longer blocks tombstone expiry. |
 | `RUST_LOG` | no | `info,loro=warn,loro_internal=warn` | `tracing-subscriber` filter. The default keeps per-document operations at `debug` (off) and silences Loro internals. `RUST_LOG=vaultcrdt_server=debug` enables verbose output. |

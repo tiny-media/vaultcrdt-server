@@ -1,4 +1,5 @@
-use super::{test_pool, test_state};
+use super::{scalar, test_db, test_state};
+use crate::db::Db;
 use crate::{build_router, cli, db};
 use axum::{
     body::{Body, to_bytes},
@@ -6,15 +7,14 @@ use axum::{
     http::{Request, StatusCode},
 };
 use serde_json::{Value, json};
-use sqlx::SqlitePool;
 use std::net::SocketAddr;
 use tower::ServiceExt;
 
 /// Run the CLI with captured stdout/stderr.
-async fn run(pool: &SqlitePool, args: &[&str]) -> (i32, String, String) {
+async fn run(db: &Db, args: &[&str]) -> (i32, String, String) {
     let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
     let (mut out, mut err) = (Vec::new(), Vec::new());
-    let code = cli::run(pool, &args, &mut out, &mut err).await;
+    let code = cli::run(db, &args, &mut out, &mut err).await;
     (
         code,
         String::from_utf8(out).unwrap(),
@@ -33,27 +33,24 @@ fn field(stdout: &str, key: &str) -> String {
 
 #[tokio::test]
 async fn cli_vault_create_registers_argon2_and_prints_secret() {
-    let pool = test_pool().await;
-    let (code, out, err) = run(&pool, &["vault", "create", "v"]).await;
+    let db = test_db().await;
+    let (code, out, err) = run(&db, &["vault", "create", "v"]).await;
     assert_eq!(code, 0);
     assert_eq!(err, "");
     assert_eq!(field(&out, "vault"), "v");
     let secret = field(&out, "secret");
     assert_eq!(secret.len(), 32);
     assert!(secret.bytes().all(|b| b.is_ascii_alphanumeric()));
-    let stored: String = sqlx::query_scalar("SELECT api_key FROM vaults WHERE vault_id = 'v'")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let stored: String = scalar(&db, "SELECT api_key FROM vaults WHERE vault_id = 'v'").await;
     assert!(stored.starts_with("$argon2"));
-    assert!(db::verify_vault(&pool, "v", &secret).await.unwrap());
+    assert!(db::verify_vault(&db, "v", &secret).await.unwrap());
 }
 
 #[tokio::test]
 async fn cli_vault_create_json_and_setup_uri() {
-    let pool = test_pool().await;
+    let db = test_db().await;
     let (code, out, err) = run(
-        &pool,
+        &db,
         &[
             "vault",
             "create",
@@ -77,47 +74,41 @@ async fn cli_vault_create_json_and_setup_uri() {
 
 #[tokio::test]
 async fn cli_vault_create_exists_exit_3() {
-    let pool = test_pool().await;
-    let (_, out, _) = run(&pool, &["vault", "create", "v"]).await;
+    let db = test_db().await;
+    let (_, out, _) = run(&db, &["vault", "create", "v"]).await;
     let secret = field(&out, "secret");
 
-    let (code, out, err) = run(&pool, &["vault", "create", "v"]).await;
+    let (code, out, err) = run(&db, &["vault", "create", "v"]).await;
     assert_eq!(code, 3);
     assert_eq!(out, "");
     assert_eq!(err, "vault exists: v\n");
-    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM vaults")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let count: i64 = scalar(&db, "SELECT count(*) FROM vaults").await;
     assert_eq!(count, 1);
-    assert!(db::verify_vault(&pool, "v", &secret).await.unwrap());
+    assert!(db::verify_vault(&db, "v", &secret).await.unwrap());
 }
 
 #[tokio::test]
 async fn cli_vault_create_invalid_name_exit_2() {
-    let pool = test_pool().await;
+    let db = test_db().await;
     for name in ["Bad-Name", "-x", &"a".repeat(65)] {
-        let (code, out, err) = run(&pool, &["vault", "create", name]).await;
+        let (code, out, err) = run(&db, &["vault", "create", name]).await;
         assert_eq!(code, 2, "name {name}");
         assert_eq!(out, "");
         assert!(err.starts_with("usage:"));
     }
-    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM vaults")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let count: i64 = scalar(&db, "SELECT count(*) FROM vaults").await;
     assert_eq!(count, 0);
 }
 
 #[tokio::test]
 async fn cli_vault_list_sorted_and_json() {
-    let pool = test_pool().await;
-    assert_eq!(run(&pool, &["vault", "list"]).await.1, "");
-    assert_eq!(run(&pool, &["vault", "list", "--json"]).await.1, "[]\n");
+    let db = test_db().await;
+    assert_eq!(run(&db, &["vault", "list"]).await.1, "");
+    assert_eq!(run(&db, &["vault", "list", "--json"]).await.1, "[]\n");
 
-    db::create_vault(&pool, "zeta", "k").await.unwrap();
-    db::create_vault(&pool, "alpha", "k").await.unwrap();
-    let (code, out, err) = run(&pool, &["vault", "list"]).await;
+    db::create_vault(&db, "zeta", "k").await.unwrap();
+    db::create_vault(&db, "alpha", "k").await.unwrap();
+    let (code, out, err) = run(&db, &["vault", "list"]).await;
     assert_eq!((code, err.as_str()), (0, ""));
     let names: Vec<&str> = out
         .lines()
@@ -126,7 +117,7 @@ async fn cli_vault_list_sorted_and_json() {
     assert_eq!(names, ["alpha", "zeta"]);
     assert!(out.starts_with("alpha  ")); // left-aligned to max width (5)
 
-    let (_, out, _) = run(&pool, &["vault", "list", "--json"]).await;
+    let (_, out, _) = run(&db, &["vault", "list", "--json"]).await;
     let value: Value = serde_json::from_str(&out).unwrap();
     assert_eq!(value[0]["vault_id"], "alpha");
     assert_eq!(value[1]["vault_id"], "zeta");
@@ -135,9 +126,9 @@ async fn cli_vault_list_sorted_and_json() {
 
 #[tokio::test]
 async fn cli_invite_mint_redeemable_via_router() {
-    let state = test_state(test_pool().await);
-    db::create_vault(&state.pool, "v", "k").await.unwrap();
-    let (code, out, err) = run(&state.pool, &["invite", "mint", "v"]).await;
+    let state = test_state(test_db().await);
+    db::create_vault(&state.db, "v", "k").await.unwrap();
+    let (code, out, err) = run(&state.db, &["invite", "mint", "v"]).await;
     assert_eq!((code, err.as_str()), (0, ""));
     let token = field(&out, "invite");
     assert_eq!(token.len(), 22);
@@ -146,12 +137,16 @@ async fn cli_invite_mint_redeemable_via_router() {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
     );
-    let (ttl, inviter): (i64, String) = sqlx::query_as(
-        "SELECT unixepoch(expires_at) - unixepoch(created_at), inviter_peer_id FROM invites",
-    )
-    .fetch_one(&state.pool)
-    .await
-    .unwrap();
+    let (ttl, inviter): (i64, String) = state
+        .db
+        .lock()
+        .await
+        .query_row(
+            "SELECT unixepoch(expires_at) - unixepoch(created_at), inviter_peer_id FROM invites",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
     assert_eq!(ttl, 900);
     assert_eq!(inviter, "operator-cli");
 
@@ -181,24 +176,21 @@ async fn cli_invite_mint_redeemable_via_router() {
 
 #[tokio::test]
 async fn cli_invite_mint_unknown_vault_exit_3() {
-    let pool = test_pool().await;
-    let (code, out, err) = run(&pool, &["invite", "mint", "nope"]).await;
+    let db = test_db().await;
+    let (code, out, err) = run(&db, &["invite", "mint", "nope"]).await;
     assert_eq!(code, 3);
     assert_eq!(out, "");
     assert_eq!(err, "vault not found: nope\n");
-    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM invites")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let count: i64 = scalar(&db, "SELECT count(*) FROM invites").await;
     assert_eq!(count, 0);
 }
 
 #[tokio::test]
 async fn cli_invite_mint_setup_uri_carries_invite() {
-    let pool = test_pool().await;
-    db::create_vault(&pool, "v", "k").await.unwrap();
+    let db = test_db().await;
+    db::create_vault(&db, "v", "k").await.unwrap();
     let (code, out, _) = run(
-        &pool,
+        &db,
         &[
             "invite",
             "mint",
@@ -222,7 +214,7 @@ async fn cli_invite_mint_setup_uri_carries_invite() {
 
 #[tokio::test]
 async fn cli_usage_and_unknown_exit_2() {
-    let pool = test_pool().await;
+    let db = test_db().await;
     for args in [
         vec!["vault"],
         vec!["vault", "frob"],
@@ -230,22 +222,19 @@ async fn cli_usage_and_unknown_exit_2() {
         vec!["vault", "create", "v", "--server-url", "ftp://x"],
         vec!["frobnicate"],
     ] {
-        let (code, out, err) = run(&pool, &args).await;
+        let (code, out, err) = run(&db, &args).await;
         assert_eq!(code, 2, "{args:?}");
         assert_eq!(out, "");
         assert!(err.starts_with("usage: vaultcrdt-server"), "{args:?}");
     }
-    let (code, out, err) = run(&pool, &["help"]).await;
+    let (code, out, err) = run(&db, &["help"]).await;
     assert_eq!(code, 0);
     assert!(out.starts_with("usage: vaultcrdt-server"));
     assert_eq!(err, "");
-    assert_eq!(run(&pool, &["--help"]).await.0, 0);
-    assert_eq!(run(&pool, &["-h"]).await.0, 0);
+    assert_eq!(run(&db, &["--help"]).await.0, 0);
+    assert_eq!(run(&db, &["-h"]).await.0, 0);
     // No vault was created by any failing invocation.
-    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM vaults")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let count: i64 = scalar(&db, "SELECT count(*) FROM vaults").await;
     assert_eq!(count, 0);
 }
 

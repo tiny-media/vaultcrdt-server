@@ -16,7 +16,7 @@ async fn run_server() -> anyhow::Result<()> {
     let admin_token =
         std::env::var("VAULTCRDT_ADMIN_TOKEN").expect("VAULTCRDT_ADMIN_TOKEN must be set");
 
-    let pool: sqlx::SqlitePool = db::create_pool(&db_path).await?;
+    let database = db::open_db(&db_path).await?;
 
     // Background task: hourly cleanup (tombstones + stale peers)
     let tombstone_days: i64 = std::env::var("VAULTCRDT_TOMBSTONE_DAYS")
@@ -27,17 +27,17 @@ async fn run_server() -> anyhow::Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_PEER_RETENTION_DAYS);
-    let hourly_pool = pool.clone();
+    let hourly_db = database.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
         loop {
             interval.tick().await;
-            match db::expire_tombstones(&hourly_pool, tombstone_days).await {
+            match db::expire_tombstones(&hourly_db, tombstone_days).await {
                 Ok(0) => {}
                 Ok(n) => info!("expired {n} stale tombstones"),
                 Err(e) => warn!("tombstone expiry failed: {e}"),
             }
-            match db::expire_stale_peers(&hourly_pool, peer_days).await {
+            match db::expire_stale_peers(&hourly_db, peer_days).await {
                 Ok(0) => {}
                 Ok(n) => info!("expired {n} stale peers (>{peer_days} days)"),
                 Err(e) => warn!("peer expiry failed: {e}"),
@@ -48,12 +48,12 @@ async fn run_server() -> anyhow::Result<()> {
     // Background task: weekly non-blocking DB maintenance
     // (wal_checkpoint(TRUNCATE) + PRAGMA optimize; no VACUUM — that is a manual
     // maintenance-window step, see db::run_full_vacuum).
-    let maint_pool = pool.clone();
+    let maint_db = database.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(7 * 24 * 3600));
         loop {
             interval.tick().await;
-            match db::run_maintenance(&maint_pool).await {
+            match db::run_maintenance(&maint_db).await {
                 Ok(()) => info!("DB maintenance complete (wal_checkpoint + optimize)"),
                 Err(e) => warn!("DB maintenance failed: {e}"),
             }
@@ -62,7 +62,7 @@ async fn run_server() -> anyhow::Result<()> {
 
     let (broadcast_tx, _) = broadcast::channel::<BroadcastEvent>(256);
     let state = AppState {
-        pool,
+        db: database,
         jwt_secret,
         admin_token,
         // Behind a CDN/tunnel/reverse-proxy chain the client IP is
@@ -107,8 +107,8 @@ async fn run_cli(args: Vec<String>) -> i32 {
     let db_path =
         std::env::var("VAULTCRDT_DB_PATH").unwrap_or_else(|_| "./vaultcrdt.db".to_string());
     // Migrations are idempotent — safe next to a running server.
-    let pool = match db::create_pool(&db_path).await {
-        Ok(pool) => pool,
+    let database = match db::open_db(&db_path).await {
+        Ok(database) => database,
         Err(e) => {
             eprintln!("error: {e}");
             return 1;
@@ -116,7 +116,7 @@ async fn run_cli(args: Vec<String>) -> i32 {
     };
     let mut out = std::io::stdout();
     let mut err = std::io::stderr();
-    cli::run(&pool, &args, &mut out, &mut err).await
+    cli::run(&database, &args, &mut out, &mut err).await
 }
 
 #[tokio::main]

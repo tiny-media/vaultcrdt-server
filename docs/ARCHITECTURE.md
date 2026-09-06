@@ -1,6 +1,6 @@
 # VaultCRDT — Architecture and sync reference
 
-Server v0.3.1 · Loro 1.13 (lockstep with the plugin) · Rust 1.94 · protocol version 1.
+Server v0.3.1 · Loro 1.16 (lockstep with the plugin) · Rust 1.95 · SQLite 3.53.2 (bundled) · protocol version 1.
 
 Self-hosted CRDT sync for Obsidian. The server is a passive merger: it holds one Loro document per note, merges client deltas, stores the snapshot, and forwards the client's delta to the other connected clients of the same vault. It has no knowledge of note text beyond the Loro binary.
 
@@ -219,7 +219,7 @@ Tombstones are sticky until retention. There is no server-side resurrection logi
 
 ### Storage
 
-SQLite, WAL mode, `synchronous = NORMAL`, pool size `VAULTCRDT_POOL_SIZE` (default 5). Migrations are embedded (`sqlx::migrate!("./migrations")`) and run on startup.
+SQLite via `rusqlite (0.40, bundled SQLite 3.53.2)` (bundled SQLite), WAL mode, `synchronous = NORMAL`, `busy_timeout = 5000`, `foreign_keys = ON`. One connection per process behind a `tokio::sync::Mutex` (`db::Db`); call sites take the lock and run the query synchronously. Migrations are embedded (`include_str!` of `migrations/*.sql`, applied by `rusqlite_migration`) and run on startup; the applied count is tracked in `PRAGMA user_version`. Databases created by the previous sqlx runner are adopted once on open: `user_version` is seeded from `_sqlx_migrations`, then that table is dropped.
 
 | Migration | Contents |
 |---|---|

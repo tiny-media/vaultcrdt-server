@@ -9,10 +9,10 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum ServerError {
     #[error("database error: {0}")]
-    Db(#[from] sqlx::Error),
+    Db(#[from] rusqlite::Error),
 
     #[error("migration error: {0}")]
-    Migration(#[from] sqlx::migrate::MigrateError),
+    Migration(#[from] rusqlite_migration::Error),
 
     #[error("auth error: {0}")]
     Auth(String),

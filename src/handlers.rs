@@ -1,5 +1,5 @@
+use crate::db::Db;
 use loro::{ExportMode, LoroDoc};
-use sqlx::SqlitePool;
 use tracing::{debug, info};
 
 use crate::{BroadcastEvent, DocLocks, db, errors::ServerError, vv_serde, ws::msg};
@@ -8,12 +8,12 @@ use crate::{BroadcastEvent, DocLocks, db, errors::ServerError, vv_serde, ws::msg
 
 pub async fn process_message(
     data: &[u8],
-    pool: &SqlitePool,
+    db: &Db,
     vault_id: &str,
     conn_id: u64,
     doc_locks: &DocLocks,
 ) -> (msg::ServerMsg, Option<BroadcastEvent>) {
-    match process_inner(data, pool, vault_id, conn_id, doc_locks).await {
+    match process_inner(data, db, vault_id, conn_id, doc_locks).await {
         Ok(result) => result,
         Err(e) => {
             let (code, message) = e.client_facing();
@@ -38,7 +38,7 @@ pub async fn process_message(
 
 async fn process_inner(
     data: &[u8],
-    pool: &SqlitePool,
+    db: &Db,
     vault_id: &str,
     conn_id: u64,
     doc_locks: &DocLocks,
@@ -51,8 +51,8 @@ async fn process_inner(
         msg::ClientMsg::Ping => Ok((msg::ServerMsg::Pong, None)),
 
         msg::ClientMsg::RequestDocList => {
-            let docs = db::list_docs_with_vv(pool, vault_id).await?;
-            let tombstones = db::list_tombstones(pool, vault_id).await?;
+            let docs = db::list_docs_with_vv(db, vault_id).await?;
+            let tombstones = db::list_tombstones(db, vault_id).await?;
             info!(
                 "request_doc_list: vault={vault_id}, docs={}, tombstones={}",
                 docs.len(),
@@ -64,7 +64,7 @@ async fn process_inner(
         msg::ClientMsg::SyncStart {
             doc_uuid,
             client_vv,
-        } => handle_sync_start(pool, vault_id, &doc_uuid, client_vv.as_deref()).await,
+        } => handle_sync_start(db, vault_id, &doc_uuid, client_vv.as_deref()).await,
 
         msg::ClientMsg::SyncPush {
             doc_uuid,
@@ -74,7 +74,7 @@ async fn process_inner(
             let lock_key = DocLocks::lock_key(vault_id, &doc_uuid);
             let lock = doc_locks.get(&lock_key);
             let _guard = lock.lock().await;
-            handle_sync_push(pool, vault_id, &doc_uuid, &delta, &peer_id, conn_id).await
+            handle_sync_push(db, vault_id, &doc_uuid, &delta, &peer_id, conn_id).await
         }
 
         msg::ClientMsg::DocCreate {
@@ -87,7 +87,7 @@ async fn process_inner(
             let lock = doc_locks.get(&lock_key);
             let _guard = lock.lock().await;
             handle_doc_create(
-                pool,
+                db,
                 vault_id,
                 &doc_uuid,
                 &snapshot,
@@ -105,7 +105,7 @@ async fn process_inner(
             let lock_key = DocLocks::lock_key(vault_id, &doc_uuid);
             let lock = doc_locks.get(&lock_key);
             let _guard = lock.lock().await;
-            db::delete_doc_and_tombstone(pool, vault_id, &doc_uuid, &peer_id).await?;
+            db::delete_doc_and_tombstone(db, vault_id, &doc_uuid, &peer_id).await?;
             debug!("doc_delete: vault={vault_id}, doc={doc_uuid}");
             let broadcast = BroadcastEvent::Delete {
                 vault_id: vault_id.to_string(),
@@ -120,12 +120,12 @@ async fn process_inner(
 // ── SyncStart ───────────────────────────────────────────────────────────────
 
 async fn handle_sync_start(
-    pool: &SqlitePool,
+    db: &Db,
     vault_id: &str,
     doc_uuid: &str,
     client_vv_bytes: Option<&[u8]>,
 ) -> Result<(msg::ServerMsg, Option<BroadcastEvent>), ServerError> {
-    let existing = db::get_snapshot_with_vv(pool, vault_id, doc_uuid).await?;
+    let existing = db::get_snapshot_with_vv(db, vault_id, doc_uuid).await?;
 
     let Some((snapshot_blob, _vv_blob)) = existing else {
         debug!("sync_start: vault={vault_id}, doc={doc_uuid} → DocUnknown");
@@ -183,7 +183,7 @@ async fn handle_sync_start(
 // ── SyncPush ────────────────────────────────────────────────────────────────
 
 async fn handle_sync_push(
-    pool: &SqlitePool,
+    db: &Db,
     vault_id: &str,
     doc_uuid: &str,
     delta: &[u8],
@@ -191,7 +191,7 @@ async fn handle_sync_push(
     conn_id: u64,
 ) -> Result<(msg::ServerMsg, Option<BroadcastEvent>), ServerError> {
     // Anti-resurrection: refuse pushes for tombstoned docs.
-    if db::is_tombstoned(pool, vault_id, doc_uuid).await? {
+    if db::is_tombstoned(db, vault_id, doc_uuid).await? {
         debug!("sync_push refused: vault={vault_id}, doc={doc_uuid} is tombstoned");
         return Ok((
             msg::ServerMsg::DocTombstoned {
@@ -201,7 +201,7 @@ async fn handle_sync_push(
         ));
     }
 
-    let existing = db::get_snapshot_with_vv(pool, vault_id, doc_uuid).await?;
+    let existing = db::get_snapshot_with_vv(db, vault_id, doc_uuid).await?;
 
     if let Some((_, existing_vv_blob)) = &existing {
         let disjoint = match vv_serde::vv_from_db_bytes(existing_vv_blob) {
@@ -238,7 +238,7 @@ async fn handle_sync_push(
     let new_vv = doc.oplog_vv();
     let new_vv_blob = vv_serde::vv_to_db_bytes(&new_vv);
 
-    db::store_snapshot_with_vv(pool, vault_id, doc_uuid, &new_snapshot, &new_vv_blob).await?;
+    db::store_snapshot_with_vv(db, vault_id, doc_uuid, &new_snapshot, &new_vv_blob).await?;
 
     debug!(
         "sync_push: vault={vault_id}, doc={doc_uuid}, delta={}b, snapshot={}b",
@@ -262,7 +262,7 @@ async fn handle_sync_push(
 // ── DocCreate ───────────────────────────────────────────────────────────────
 
 async fn handle_doc_create(
-    pool: &SqlitePool,
+    db: &Db,
     vault_id: &str,
     doc_uuid: &str,
     snapshot: &[u8],
@@ -276,7 +276,7 @@ async fn handle_doc_create(
     // incoming snapshot as the new document identity for this path.
     // `replace_tombstone` only takes effect when the doc is actually tombstoned —
     // on a live doc it must not discard the server snapshot (silent LWW loss).
-    let was_tombstoned = db::is_tombstoned(pool, vault_id, doc_uuid).await?;
+    let was_tombstoned = db::is_tombstoned(db, vault_id, doc_uuid).await?;
     if was_tombstoned && !replace_tombstone {
         debug!("doc_create refused: vault={vault_id}, doc={doc_uuid} is tombstoned");
         return Ok((
@@ -291,7 +291,7 @@ async fn handle_doc_create(
         debug!("doc_create replacing tombstone: vault={vault_id}, doc={doc_uuid}");
     }
 
-    let existing = db::get_snapshot_with_vv(pool, vault_id, doc_uuid).await?;
+    let existing = db::get_snapshot_with_vv(db, vault_id, doc_uuid).await?;
 
     if !effective_replace && let Some((_, existing_vv_blob)) = &existing {
         let disjoint = match vv_serde::vv_from_db_bytes(existing_vv_blob) {
@@ -335,12 +335,12 @@ async fn handle_doc_create(
     let new_vv = doc.oplog_vv();
     let new_vv_blob = vv_serde::vv_to_db_bytes(&new_vv);
 
-    db::store_snapshot_with_vv(pool, vault_id, doc_uuid, &new_snapshot, &new_vv_blob).await?;
+    db::store_snapshot_with_vv(db, vault_id, doc_uuid, &new_snapshot, &new_vv_blob).await?;
 
     // Remove tombstone only after a successful store — otherwise a failed
     // import/export would leave neither doc nor tombstone.
     if effective_replace {
-        db::remove_tombstone(pool, vault_id, doc_uuid).await?;
+        db::remove_tombstone(db, vault_id, doc_uuid).await?;
     }
 
     debug!(

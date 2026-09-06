@@ -216,7 +216,7 @@ async fn handle_socket(
 
     // Persist peer info for the "synced devices" list
     if !peer_id.is_empty()
-        && let Err(e) = db::upsert_peer(&state.pool, &vault_id, &peer_id, &device_name).await
+        && let Err(e) = db::upsert_peer(&state.db, &vault_id, &peer_id, &device_name).await
     {
         warn!("conn {conn_id}: failed to upsert peer: {e}");
     }
@@ -237,7 +237,7 @@ async fn handle_socket(
 
     // Task 2: Client → Server (read messages, dispatch to handlers)
     let write_tx_read = write_tx.clone();
-    let pool = state.pool.clone();
+    let conn_db = state.db.clone();
     let broadcast_tx = state.broadcast_tx.clone();
     let doc_locks = state.doc_locks.clone();
     let vault_id_read = vault_id.clone();
@@ -273,7 +273,7 @@ async fn handle_socket(
                     }
                     let (response, maybe_broadcast) = handlers::process_message(
                         &data,
-                        &pool,
+                        &conn_db,
                         &vault_id_read,
                         conn_id,
                         &doc_locks,

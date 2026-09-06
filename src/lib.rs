@@ -14,9 +14,9 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
+use db::Db;
 use errors::ServerError;
 use serde::{Deserialize, Serialize};
-use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -91,7 +91,7 @@ pub struct ConnectionInfo {
 
 #[derive(Clone)]
 pub struct AppState {
-    pub pool: SqlitePool,
+    pub db: Db,
     pub jwt_secret: String,
     pub admin_token: String,
     pub trust_proxy: bool,
@@ -229,10 +229,10 @@ async fn auth_verify_body(
         ));
     }
 
-    let exists = db::vault_exists(&state.pool, &body.vault_id).await?;
+    let exists = db::vault_exists(&state.db, &body.vault_id).await?;
 
     if exists {
-        let ok = db::verify_vault(&state.pool, &body.vault_id, &body.api_key).await?;
+        let ok = db::verify_vault(&state.db, &body.vault_id, &body.api_key).await?;
         if !ok {
             return Err(ServerError::Auth("Authentication failed".to_string()));
         }
@@ -241,9 +241,9 @@ async fn auth_verify_body(
         if !auth::constant_time_eq(key, &state.admin_token) {
             return Err(ServerError::Auth("Authentication failed".to_string()));
         }
-        if db::create_vault(&state.pool, &body.vault_id, &body.api_key).await? {
+        if db::create_vault(&state.db, &body.vault_id, &body.api_key).await? {
             info!("auth: new vault registered vault_id={}", body.vault_id);
-        } else if !db::verify_vault(&state.pool, &body.vault_id, &body.api_key).await? {
+        } else if !db::verify_vault(&state.db, &body.vault_id, &body.api_key).await? {
             return Err(ServerError::Auth("Authentication failed".to_string()));
         }
     }
@@ -302,7 +302,7 @@ async fn vault_stats_handler(
     State(state): State<AppState>,
     VaultAuth(vault_id): VaultAuth,
 ) -> Result<impl IntoResponse, ServerError> {
-    let stats = db::vault_stats(&state.pool, &vault_id).await?;
+    let stats = db::vault_stats(&state.db, &vault_id).await?;
     Ok(Json(stats))
 }
 
@@ -312,7 +312,7 @@ async fn vault_peers_handler(
     State(state): State<AppState>,
     VaultAuth(vault_id): VaultAuth,
 ) -> Result<impl IntoResponse, ServerError> {
-    let peers = db::list_peers(&state.pool, &vault_id).await?;
+    let peers = db::list_peers(&state.db, &vault_id).await?;
     Ok(Json(serde_json::json!({ "peers": peers })))
 }
 
@@ -370,7 +370,7 @@ async fn retire_peer_handler(
     };
 
     // 3. Peer lookup by (vault_id, peer_id). Unknown pair → 404.
-    let Some(peer) = db::get_peer(&state.pool, &vault_id, &peer_id).await? else {
+    let Some(peer) = db::get_peer(&state.db, &vault_id, &peer_id).await? else {
         return Ok((
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
@@ -398,21 +398,20 @@ async fn retire_peer_handler(
     // 5. Match → delete peer (scoped to vault) and report an upper-bound hint of
     //    tombstones this peer was blocking.
     let tombstones_possibly_freed =
-        db::count_peer_blocked_tombstones(&state.pool, &vault_id, &peer.last_seen_at).await?;
-    let mut tx = state.pool.begin().await?;
-    sqlx::query(
-        "UPDATE device_keys SET revoked_at = datetime('now') WHERE vault_id = ? AND peer_id = ?",
-    )
-    .bind(&vault_id)
-    .bind(&peer_id)
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query("DELETE FROM peers WHERE vault_id = ? AND peer_id = ?")
-        .bind(&vault_id)
-        .bind(&peer_id)
-        .execute(&mut *tx)
-        .await?;
-    tx.commit().await?;
+        db::count_peer_blocked_tombstones(&state.db, &vault_id, &peer.last_seen_at).await?;
+    {
+        let mut conn = state.db.lock().await;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE device_keys SET revoked_at = datetime('now') WHERE vault_id = ? AND peer_id = ?",
+            rusqlite::params![&vault_id, &peer_id],
+        )?;
+        tx.execute(
+            "DELETE FROM peers WHERE vault_id = ? AND peer_id = ?",
+            rusqlite::params![&vault_id, &peer_id],
+        )?;
+        tx.commit()?;
+    }
     info!("peer retired vault_id={vault_id} peer_id={peer_id}");
 
     Ok((

@@ -8,10 +8,10 @@ use crate::{AppState, BroadcastEvent, DocLocks, build_router, db, ws::msg};
 // ── Test helpers ────────────────────────────────────────────────────────────
 
 async fn spawn_server() -> (String, AppState) {
-    let pool = db::create_pool(":memory:").await.expect("pool");
+    let db = db::open_db(":memory:").await.expect("db");
     let (broadcast_tx, _) = tokio::sync::broadcast::channel::<BroadcastEvent>(256);
     let state = AppState {
-        pool,
+        db,
         jwt_secret: "test-secret".to_string(),
         admin_token: "test-admin".to_string(),
         trust_proxy: false,
@@ -292,7 +292,7 @@ async fn test_ws_post_auth_auth_is_bad_frame_without_close() {
 #[tokio::test]
 async fn test_ws_ping_pong() {
     let (addr, state) = spawn_server().await;
-    db::create_vault(&state.pool, "v1", "key1").await.unwrap();
+    db::create_vault(&state.db, "v1", "key1").await.unwrap();
     let token = get_token(&state.jwt_secret, "v1");
 
     let (mut sink, mut stream) = ws_connect(&addr, &token).await;
@@ -304,7 +304,7 @@ async fn test_ws_ping_pong() {
 #[tokio::test]
 async fn test_ws_request_doc_list_empty() {
     let (addr, state) = spawn_server().await;
-    db::create_vault(&state.pool, "v1", "key1").await.unwrap();
+    db::create_vault(&state.db, "v1", "key1").await.unwrap();
     let token = get_token(&state.jwt_secret, "v1");
 
     let (mut sink, mut stream) = ws_connect(&addr, &token).await;
@@ -322,7 +322,7 @@ async fn test_ws_request_doc_list_empty() {
 #[tokio::test]
 async fn test_ws_doc_create_and_list() {
     let (addr, state) = spawn_server().await;
-    db::create_vault(&state.pool, "v1", "key1").await.unwrap();
+    db::create_vault(&state.db, "v1", "key1").await.unwrap();
     let token = get_token(&state.jwt_secret, "v1");
 
     let (mut sink, mut stream) = ws_connect(&addr, &token).await;
@@ -362,7 +362,7 @@ async fn test_ws_doc_create_and_list() {
 #[tokio::test]
 async fn test_ws_sync_start_unknown_doc() {
     let (addr, state) = spawn_server().await;
-    db::create_vault(&state.pool, "v1", "key1").await.unwrap();
+    db::create_vault(&state.db, "v1", "key1").await.unwrap();
     let token = get_token(&state.jwt_secret, "v1");
 
     let (mut sink, mut stream) = ws_connect(&addr, &token).await;
@@ -387,7 +387,7 @@ async fn test_ws_sync_start_unknown_doc() {
 #[tokio::test]
 async fn test_ws_sync_start_full_snapshot() {
     let (addr, state) = spawn_server().await;
-    db::create_vault(&state.pool, "v1", "key1").await.unwrap();
+    db::create_vault(&state.db, "v1", "key1").await.unwrap();
     let token = get_token(&state.jwt_secret, "v1");
 
     let (mut sink, mut stream) = ws_connect(&addr, &token).await;
@@ -439,7 +439,7 @@ async fn test_ws_sync_start_full_snapshot() {
 #[tokio::test]
 async fn test_ws_sync_start_incremental_delta() {
     let (addr, state) = spawn_server().await;
-    db::create_vault(&state.pool, "v1", "key1").await.unwrap();
+    db::create_vault(&state.db, "v1", "key1").await.unwrap();
     let token = get_token(&state.jwt_secret, "v1");
 
     let (mut sink, mut stream) = ws_connect(&addr, &token).await;
@@ -502,7 +502,7 @@ async fn test_ws_sync_start_incremental_delta() {
 #[tokio::test]
 async fn test_ws_sync_push_and_broadcast() {
     let (addr, state) = spawn_server().await;
-    db::create_vault(&state.pool, "v1", "key1").await.unwrap();
+    db::create_vault(&state.db, "v1", "key1").await.unwrap();
     let token = get_token(&state.jwt_secret, "v1");
 
     // Client A
@@ -592,7 +592,7 @@ async fn test_ws_sync_push_and_broadcast() {
 #[tokio::test]
 async fn test_ws_concurrent_sync_push_merge() {
     let (addr, state) = spawn_server().await;
-    db::create_vault(&state.pool, "v1", "key1").await.unwrap();
+    db::create_vault(&state.db, "v1", "key1").await.unwrap();
     let token = get_token(&state.jwt_secret, "v1");
 
     let (mut sink_a, mut stream_a) = ws_connect(&addr, &token).await;
@@ -671,7 +671,7 @@ async fn test_ws_concurrent_sync_push_merge() {
     }
 
     // Verify server has merged both
-    let (snap, _) = db::get_snapshot_with_vv(&state.pool, "v1", "note.md")
+    let (snap, _) = db::get_snapshot_with_vv(&state.db, "v1", "note.md")
         .await
         .unwrap()
         .unwrap();
@@ -687,7 +687,7 @@ async fn test_ws_concurrent_sync_push_merge() {
 #[tokio::test]
 async fn test_ws_doc_delete_and_broadcast() {
     let (addr, state) = spawn_server().await;
-    db::create_vault(&state.pool, "v1", "key1").await.unwrap();
+    db::create_vault(&state.db, "v1", "key1").await.unwrap();
     let token = get_token(&state.jwt_secret, "v1");
 
     let (mut sink_a, mut stream_a) = ws_connect(&addr, &token).await;
@@ -733,22 +733,22 @@ async fn test_ws_doc_delete_and_broadcast() {
 
     // Doc should be gone, tombstone should exist
     assert!(
-        db::get_snapshot_with_vv(&state.pool, "v1", "note.md")
+        db::get_snapshot_with_vv(&state.db, "v1", "note.md")
             .await
             .unwrap()
             .is_none()
     );
-    let tombs = db::list_tombstones(&state.pool, "v1").await.unwrap();
+    let tombs = db::list_tombstones(&state.db, "v1").await.unwrap();
     assert_eq!(tombs, vec!["note.md"]);
 }
 
 #[tokio::test]
 async fn test_ws_vault_isolation() {
     let (addr, state) = spawn_server().await;
-    db::create_vault(&state.pool, "vault-a", "key-a")
+    db::create_vault(&state.db, "vault-a", "key-a")
         .await
         .unwrap();
-    db::create_vault(&state.pool, "vault-b", "key-b")
+    db::create_vault(&state.db, "vault-b", "key-b")
         .await
         .unwrap();
 
@@ -810,7 +810,7 @@ async fn test_ws_invalid_token_rejected() {
 #[tokio::test]
 async fn test_ws_connection_tracking() {
     let (addr, state) = spawn_server().await;
-    db::create_vault(&state.pool, "v1", "key1").await.unwrap();
+    db::create_vault(&state.db, "v1", "key1").await.unwrap();
     let token = get_token(&state.jwt_secret, "v1");
 
     assert_eq!(state.connections.lock().unwrap().len(), 0);
@@ -831,7 +831,7 @@ async fn test_ws_connection_tracking() {
 #[tokio::test]
 async fn test_ws_corrupted_loro_delta_returns_error() {
     let (addr, state) = spawn_server().await;
-    db::create_vault(&state.pool, "v1", "key1").await.unwrap();
+    db::create_vault(&state.db, "v1", "key1").await.unwrap();
     let token = get_token(&state.jwt_secret, "v1");
 
     let (mut sink, mut stream) = ws_connect(&addr, &token).await;
@@ -875,7 +875,7 @@ async fn test_ws_corrupted_loro_delta_returns_error() {
 #[tokio::test]
 async fn test_ws_invalid_msgpack_returns_error() {
     let (addr, state) = spawn_server().await;
-    db::create_vault(&state.pool, "v1", "key1").await.unwrap();
+    db::create_vault(&state.db, "v1", "key1").await.unwrap();
     let token = get_token(&state.jwt_secret, "v1");
 
     let (mut sink, mut stream) = ws_connect(&addr, &token).await;
@@ -897,7 +897,7 @@ async fn test_ws_invalid_msgpack_returns_error() {
 #[tokio::test]
 async fn test_ws_full_lifecycle() {
     let (addr, state) = spawn_server().await;
-    db::create_vault(&state.pool, "v1", "key1").await.unwrap();
+    db::create_vault(&state.db, "v1", "key1").await.unwrap();
     let token = get_token(&state.jwt_secret, "v1");
 
     let (mut sink, mut stream) = ws_connect(&addr, &token).await;

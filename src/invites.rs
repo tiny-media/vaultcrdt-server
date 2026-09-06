@@ -4,12 +4,12 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use rusqlite::{OptionalExtension, params};
 use serde::Deserialize;
 use serde_json::json;
-use sqlx::Row;
 use std::net::SocketAddr;
 
-use crate::{AppState, VaultAuth, auth, db, errors::ServerError};
+use crate::{AppState, VaultAuth, auth, db, db::Db, errors::ServerError};
 
 // UUID v4 uses the existing OS-backed randomness source. Exclude the two
 // version/variant bytes; rejection sampling avoids alphabet modulo bias.
@@ -73,7 +73,7 @@ pub async fn create(
         return Ok(error(StatusCode::BAD_REQUEST, "peer_id must not be empty"));
     }
     let (invite, expires_at) = mint_invite(
-        &state.pool,
+        &state.db,
         &vault_id,
         &body.peer_id,
         body.device_name.as_deref(),
@@ -87,7 +87,7 @@ pub async fn create(
 
 /// Mint one invite row. Shared by the HTTP handler and the operator CLI.
 pub(crate) async fn mint_invite(
-    pool: &sqlx::SqlitePool,
+    db: &Db,
     vault_id: &str,
     inviter_peer_id: &str,
     device_name: Option<&str>,
@@ -98,15 +98,17 @@ pub(crate) async fn mint_invite(
     );
     // Housekeeping: invites live minutes; rows older than a day are dead
     // weight (the redeem scan only considers the last day anyway).
-    sqlx::query("DELETE FROM invites WHERE created_at < datetime('now', '-1 day')")
-        .execute(pool)
-        .await?;
+    let conn = db.lock().await;
+    conn.execute(
+        "DELETE FROM invites WHERE created_at < datetime('now', '-1 day')",
+        [],
+    )?;
     let hash = sha256_hex(&invite);
-    let expires_at: String = sqlx::query_scalar(
+    let expires_at: String = conn.query_row(
         "INSERT INTO invites (vault_id, token_hash, inviter_peer_id, device_name, expires_at) VALUES (?, ?, ?, ?, datetime('now', '+15 minutes')) RETURNING expires_at",
-    )
-    .bind(vault_id).bind(hash).bind(inviter_peer_id).bind(device_name)
-    .fetch_one(pool).await?;
+        params![vault_id, hash, inviter_peer_id, device_name],
+        |r| r.get(0),
+    )?;
     Ok((invite, expires_at))
 }
 
@@ -134,51 +136,52 @@ pub async fn redeem(
     }
     // No caller-controlled vault selector or per-vault brute-force counter.
     // Keep used/expired hashes so their exact, authenticated errors remain available.
-    let candidates = sqlx::query(
-        "SELECT id, vault_id, token_hash FROM invites WHERE created_at > datetime('now', '-1 day')",
-    )
-    .fetch_all(&state.pool)
-    .await?;
+    let candidates: Vec<(i64, String, String)> = {
+        let conn = state.db.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT id, vault_id, token_hash FROM invites WHERE created_at > datetime('now', '-1 day')",
+        )?;
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
     let matched = candidates
         .into_iter()
-        .find(|row| row.get::<&str, _>("token_hash") == sha256_hex(&body.invite).as_str());
-    let Some(row) = matched else {
+        .find(|(_, _, token_hash)| token_hash.as_str() == sha256_hex(&body.invite).as_str());
+    let Some((id, vault_id, _)) = matched else {
         return Ok(error(StatusCode::UNAUTHORIZED, "invalid invite"));
     };
-    let id: i64 = row.get("id");
-    let vault_id: String = row.get("vault_id");
     let device_key = random_secret(
         32,
         b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
     );
     let hash = db::hash_secret(&device_key)?;
     let token = auth::jwt_sign(&vault_id, &state.jwt_secret)?;
-    let mut tx = state.pool.begin().await?;
+    let mut conn = state.db.lock().await;
+    let tx = conn.transaction()?;
     // First statement is a write: no deferred read-to-write upgrade race.
-    let updated = sqlx::query("UPDATE invites SET used_at = datetime('now') WHERE id = ? AND used_at IS NULL AND expires_at > datetime('now')")
-        .bind(id).execute(&mut *tx).await?.rows_affected();
+    let updated = tx.execute(
+        "UPDATE invites SET used_at = datetime('now') WHERE id = ? AND used_at IS NULL AND expires_at > datetime('now')",
+        params![id],
+    )?;
     if updated == 0 {
-        let used: Option<String> = sqlx::query_scalar("SELECT used_at FROM invites WHERE id = ?")
-            .bind(id)
-            .fetch_one(&mut *tx)
-            .await?;
-        tx.rollback().await?;
+        let used: Option<String> = tx.query_row(
+            "SELECT used_at FROM invites WHERE id = ?",
+            params![id],
+            |r| r.get(0),
+        )?;
+        tx.rollback()?;
         return Ok(if used.is_some() {
             error(StatusCode::CONFLICT, "invite already used")
         } else {
             error(StatusCode::GONE, "invite expired")
         });
     }
-    sqlx::query(
+    tx.execute(
         "INSERT INTO device_keys (vault_id, peer_id, key_hash, device_name) VALUES (?, ?, ?, ?)",
-    )
-    .bind(&vault_id)
-    .bind(body.peer_id)
-    .bind(hash)
-    .bind(body.device_name)
-    .execute(&mut *tx)
-    .await?;
-    tx.commit().await?;
+        params![&vault_id, body.peer_id, hash, body.device_name],
+    )?;
+    tx.commit()?;
+    drop(conn);
     Ok(
         Json(json!({"device_key": device_key, "token": token, "vault_id": vault_id}))
             .into_response(),
@@ -196,8 +199,15 @@ pub async fn device_auth(
     State(state): State<AppState>,
     Json(body): Json<DeviceRequest>,
 ) -> Result<Response, ServerError> {
-    let hash: Option<String> = sqlx::query_scalar("SELECT key_hash FROM device_keys WHERE vault_id = ? AND peer_id = ? AND revoked_at IS NULL")
-        .bind(&body.vault_id).bind(body.peer_id).fetch_optional(&state.pool).await?;
+    let hash: Option<String> = {
+        let conn = state.db.lock().await;
+        conn.query_row(
+            "SELECT key_hash FROM device_keys WHERE vault_id = ? AND peer_id = ? AND revoked_at IS NULL",
+            params![&body.vault_id, body.peer_id],
+            |r| r.get(0),
+        )
+        .optional()?
+    };
     if !hash.is_some_and(|hash| db::verify_secret(&body.device_key, &hash)) {
         return Ok(error(StatusCode::UNAUTHORIZED, "authentication failed"));
     }

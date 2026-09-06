@@ -25,8 +25,8 @@ path = "src/main.rs"
 
 [dependencies]
 axum            = { version = "0.8", features = ["ws"] }
-sqlx            = { version = "0.9", features = ["runtime-tokio", "sqlite", "migrate"] }
-libsqlite3-sys  = { version = "0.37", features = ["bundled"] }
+rusqlite        = { version = "0.40", features = ["bundled"] }
+rusqlite_migration = "2.6"
 jsonwebtoken    = { version = "11.0.0", default-features = false, features = ["rust_crypto"] }
 loro            = "=1.16.0"
 rmp-serde       = "1"
