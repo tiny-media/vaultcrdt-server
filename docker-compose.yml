@@ -2,6 +2,9 @@ services:
   server:
     build: .
     restart: unless-stopped
+    # PID-1 signal forwarding + zombie reaping; grace lets SQLite flush on SIGTERM
+    init: true
+    stop_grace_period: 20s
     ports:
       - "3737:8080"
     volumes:

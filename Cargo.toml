@@ -4,7 +4,7 @@ members = ["."]
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.94"
+rust-version = "1.95"
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/tiny-media/vaultcrdt-server"
 

@@ -1,4 +1,6 @@
 # ── Stage 1: base with Rust + cargo-chef ────────────────────────────────────
+# ponytail: image stays on 1.95.0 until a 1.98.1-alpine tag exists
+# (1.98.0 carries a null-vtable-slot UB bug; toolchain elsewhere is 1.98.1)
 FROM rust:1.95.0-alpine3.23 AS chef
 RUN apk add --no-cache musl-dev && cargo install cargo-chef --locked
 WORKDIR /app
