@@ -143,7 +143,7 @@ Server → client:
 | `sync_delta` | `doc_uuid`, `delta`, `server_vv` | reply to `sync_start` |
 | `doc_unknown` | `doc_uuid` | server has no such document |
 | `delta_broadcast` | `doc_uuid`, `delta`, `peer_id`, `server_vv` | another client pushed |
-| `doc_deleted` | `doc_uuid` | another client deleted |
+| `doc_deleted` | `doc_uuid`, `content_hash?` | another client deleted |
 | `doc_tombstoned` | `doc_uuid` | push refused: document is tombstoned |
 | `create_conflict` | `doc_uuid` | push/create refused: disjoint history |
 
@@ -198,7 +198,7 @@ After every `delta_broadcast` the client checks whether its local VV covers `ser
 
 `sync_start`: unknown document → `doc_unknown`; `client_vv` present → `ExportMode::updates(client_vv)`; absent → stored snapshot.
 
-`doc_delete`: removes the document row and writes a tombstone `(vault_id, doc_uuid, deleted_by, deleted_at)`; broadcasts `doc_deleted`.
+`doc_delete`: removes the document row and writes a tombstone `(vault_id, doc_uuid, deleted_by, deleted_at, content_hash)` — `content_hash` is captured from the snapshot before delete, or kept via `COALESCE` on a re-delete with no document row; broadcasts `doc_deleted` with that hash.
 
 `sync_push`, `doc_create` and `doc_delete` on the same `(vault_id, doc_uuid)` are serialised through a per-document async lock (`DocLocks`). The tombstone checks are check-then-act and hold only under this lock.
 

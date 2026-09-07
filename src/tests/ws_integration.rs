@@ -736,10 +736,15 @@ async fn test_ws_doc_delete_and_broadcast() {
         other => panic!("expected Ack, got {other:?}"),
     }
 
-    // B should receive DocDeleted
+    // B should receive DocDeleted with the hash captured at delete.
+    let expected_hash = crate::fnv::fnv1a_64_hex("content");
     match recv_msg(&mut stream_b).await {
-        msg::ServerMsg::DocDeleted { doc_uuid } => {
+        msg::ServerMsg::DocDeleted {
+            doc_uuid,
+            content_hash,
+        } => {
             assert_eq!(doc_uuid, "note.md");
+            assert_eq!(content_hash.as_deref(), Some(expected_hash.as_str()));
         }
         other => panic!("expected DocDeleted, got {other:?}"),
     }
@@ -753,6 +758,49 @@ async fn test_ws_doc_delete_and_broadcast() {
     );
     let tombs = db::list_tombstones(&state.db, "v1").await.unwrap();
     assert_eq!(tombs, vec!["note.md"]);
+
+    // Re-delete (no document row): B must receive the COALESCE-retained hash.
+    send_msg(
+        &mut sink_a,
+        &msg::ClientMsg::DocDelete {
+            doc_uuid: "note.md".to_string(),
+            peer_id: "peer-a".to_string(),
+        },
+    )
+    .await;
+    match recv_msg(&mut stream_a).await {
+        msg::ServerMsg::Ack => {}
+        other => panic!("expected Ack on re-delete, got {other:?}"),
+    }
+    match recv_msg(&mut stream_b).await {
+        msg::ServerMsg::DocDeleted {
+            doc_uuid,
+            content_hash,
+        } => {
+            assert_eq!(doc_uuid, "note.md");
+            assert_eq!(content_hash.as_deref(), Some(expected_hash.as_str()));
+        }
+        other => panic!("expected DocDeleted on re-delete, got {other:?}"),
+    }
+
+    send_msg(&mut sink_a, &msg::ClientMsg::RequestDocList).await;
+    match recv_msg(&mut stream_a).await {
+        msg::ServerMsg::DocList {
+            docs,
+            tombstones,
+            tombstone_hashes,
+        } => {
+            assert!(docs.is_empty());
+            assert_eq!(tombstones, vec!["note.md"]);
+            assert_eq!(tombstone_hashes.len(), 1);
+            assert_eq!(tombstone_hashes[0].doc_uuid, "note.md");
+            assert_eq!(
+                tombstone_hashes[0].content_hash.as_deref(),
+                Some(expected_hash.as_str())
+            );
+        }
+        other => panic!("expected DocList, got {other:?}"),
+    }
 }
 
 #[tokio::test]

@@ -1853,9 +1853,10 @@ async fn test_delete_captures_fnv_content_hash() {
         .await
         .unwrap();
 
-    db::delete_doc_and_tombstone(&db, "v", "note.md", "peer-x")
+    let returned = db::delete_doc_and_tombstone(&db, "v", "note.md", "peer-x")
         .await
         .unwrap();
+    assert_eq!(returned.as_deref(), Some("a6a9b25f2a464e61"));
 
     let hashes = db::list_tombstones_with_hash(&db, "v").await.unwrap();
     assert_eq!(hashes.len(), 1);
@@ -1866,9 +1867,10 @@ async fn test_delete_captures_fnv_content_hash() {
 #[tokio::test]
 async fn test_delete_without_document_row_stores_null_hash() {
     let db = test_db().await;
-    db::delete_doc_and_tombstone(&db, "v", "ghost.md", "peer-x")
+    let returned = db::delete_doc_and_tombstone(&db, "v", "ghost.md", "peer-x")
         .await
         .unwrap();
+    assert_eq!(returned, None);
 
     let hashes = db::list_tombstones_with_hash(&db, "v").await.unwrap();
     assert_eq!(hashes.len(), 1);
@@ -1904,9 +1906,10 @@ async fn test_replayed_delete_preserves_captured_hash() {
     .await;
 
     // Replay: document row is already gone — hash must survive.
-    db::delete_doc_and_tombstone(&db, "v", "note.md", "peer-2")
+    let replayed = db::delete_doc_and_tombstone(&db, "v", "note.md", "peer-2")
         .await
         .unwrap();
+    assert_eq!(replayed.as_deref(), Some("a6a9b25f2a464e61"));
 
     let deleted_by: String = scalar(
         &db,
@@ -2053,4 +2056,73 @@ async fn test_delete_recreate_delete_stores_second_version_hash() {
     assert_eq!(second.len(), 1);
     assert_eq!(second[0].doc_uuid, "same.md");
     assert_eq!(second[0].content_hash.as_deref(), Some("708d67b2a1da6d2f"));
+}
+
+#[tokio::test]
+async fn test_doc_delete_broadcast_carries_captured_and_coalesce_hash() {
+    use crate::handlers::process_message;
+    use crate::ws::msg;
+
+    let db = test_db().await;
+    db::create_vault(&db, "v", "k").await.unwrap();
+    let doc_locks = DocLocks::default();
+
+    let (snapshot, vv) = loro_snapshot_with_content("vaultcrdt fnv golden");
+    db::store_snapshot_with_vv(&db, "v", "note.md", &snapshot, &vv)
+        .await
+        .unwrap();
+
+    let delete = rmp_serde::to_vec_named(&msg::ClientMsg::DocDelete {
+        doc_uuid: "note.md".into(),
+        peer_id: "peer-1".into(),
+    })
+    .unwrap();
+    let (resp, broadcast) = process_message(&delete, &db, "v", 1, &doc_locks).await;
+    assert!(matches!(resp, msg::ServerMsg::Ack));
+    match broadcast {
+        Some(BroadcastEvent::Delete {
+            doc_uuid,
+            content_hash,
+            ..
+        }) => {
+            assert_eq!(doc_uuid, "note.md");
+            assert_eq!(content_hash.as_deref(), Some("a6a9b25f2a464e61"));
+        }
+        other => panic!("expected Delete broadcast, got {other:?}"),
+    }
+
+    // Re-delete: document row is gone — COALESCE must retain the captured hash.
+    let (resp, broadcast) = process_message(&delete, &db, "v", 2, &doc_locks).await;
+    assert!(matches!(resp, msg::ServerMsg::Ack));
+    match broadcast {
+        Some(BroadcastEvent::Delete {
+            doc_uuid,
+            content_hash,
+            ..
+        }) => {
+            assert_eq!(doc_uuid, "note.md");
+            assert_eq!(content_hash.as_deref(), Some("a6a9b25f2a464e61"));
+        }
+        other => panic!("expected Delete broadcast on re-delete, got {other:?}"),
+    }
+
+    let req = rmp_serde::to_vec_named(&msg::ClientMsg::RequestDocList).unwrap();
+    let (resp, _) = process_message(&req, &db, "v", 3, &doc_locks).await;
+    match resp {
+        msg::ServerMsg::DocList {
+            docs,
+            tombstones,
+            tombstone_hashes,
+        } => {
+            assert!(docs.is_empty());
+            assert_eq!(tombstones, vec!["note.md"]);
+            assert_eq!(tombstone_hashes.len(), 1);
+            assert_eq!(tombstone_hashes[0].doc_uuid, "note.md");
+            assert_eq!(
+                tombstone_hashes[0].content_hash.as_deref(),
+                Some("a6a9b25f2a464e61")
+            );
+        }
+        other => panic!("expected DocList, got {other:?}"),
+    }
 }

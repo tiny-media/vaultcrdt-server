@@ -95,6 +95,8 @@ pub mod msg {
         },
         DocDeleted {
             doc_uuid: String,
+            #[serde(default)]
+            content_hash: Option<String>,
         },
         DocTombstoned {
             doc_uuid: String,
@@ -336,8 +338,12 @@ async fn handle_socket(
                     vault_id: evt_vault,
                     doc_uuid,
                     sender_conn_id,
+                    content_hash,
                 }) if evt_vault == vault_id && sender_conn_id != conn_id => {
-                    let msg = msg::ServerMsg::DocDeleted { doc_uuid };
+                    let msg = msg::ServerMsg::DocDeleted {
+                        doc_uuid,
+                        content_hash,
+                    };
                     let Ok(bytes) = rmp_serde::to_vec_named(&msg) else {
                         break;
                     };

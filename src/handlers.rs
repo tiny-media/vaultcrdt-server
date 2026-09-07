@@ -113,12 +113,14 @@ async fn process_inner(
             let lock_key = DocLocks::lock_key(vault_id, &doc_uuid);
             let lock = doc_locks.get(&lock_key);
             let _guard = lock.lock().await;
-            db::delete_doc_and_tombstone(db, vault_id, &doc_uuid, &peer_id).await?;
+            let content_hash =
+                db::delete_doc_and_tombstone(db, vault_id, &doc_uuid, &peer_id).await?;
             debug!("doc_delete: vault={vault_id}, doc={doc_uuid}");
             let broadcast = BroadcastEvent::Delete {
                 vault_id: vault_id.to_string(),
                 doc_uuid,
                 sender_conn_id: conn_id,
+                content_hash,
             };
             Ok((msg::ServerMsg::Ack, Some(broadcast)))
         }

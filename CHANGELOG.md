@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `doc_deleted` broadcasts carry additive `content_hash` (captured at
+  delete, or the COALESCE-retained tombstone hash on re-delete) so live
+  clients can keep-prove against the tombstone. Old clients ignore the
+  extra map key.
+
 ## [0.4.1] - 2026-09-07
 
 ### Added

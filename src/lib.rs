@@ -81,6 +81,7 @@ pub enum BroadcastEvent {
         vault_id: String,
         doc_uuid: String,
         sender_conn_id: u64,
+        content_hash: Option<String>,
     },
     BlobPathChanged {
         vault_id: String,
