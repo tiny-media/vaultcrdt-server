@@ -24,6 +24,9 @@ pub const SEGMENT_BODY_GUARD: usize = SEGMENT_BYTES + 4 * 1024;
 const IMAGE_CAP: u64 = 10 * 1024 * 1024;
 const PDF_CAP: u64 = 10 * 1024 * 1024;
 const AUDIO_CAP: u64 = 25 * 1024 * 1024;
+/// Allowlisted `.obsidian/` config files. Below ABSOLUTE_MAX; image/pdf/audio
+/// caps are untouched and this cap does not interact with upload creation.
+const OBSIDIAN_CAP: u64 = 2 * 1024 * 1024;
 /// Largest per-type cap. POST /uploads has no extension, so creation can only
 /// enforce this ceiling; extension-specific caps run at blob-paths.
 const ABSOLUTE_MAX: u64 = AUDIO_CAP;
@@ -109,6 +112,30 @@ fn last_extension(name: &str) -> Option<&str> {
     Some(ext)
 }
 
+/// Shared allowlist with the plugin (identical shapes). Client keys arrive
+/// full-casefolded (Unicode C+F), not merely lowercased; for these ASCII
+/// literals that is equivalent. Everything else under `.obsidian/` stays blocked.
+fn obsidian_allowlisted(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix(".obsidian/") else {
+        return false;
+    };
+    if rest == "app.json" || rest == "appearance.json" {
+        return true;
+    }
+    if let Some(name) = rest.strip_prefix("snippets/") {
+        return !name.is_empty() && !name.contains('/') && last_extension(name) == Some("css");
+    }
+    if let Some(theme_rest) = rest.strip_prefix("themes/") {
+        let Some((dir, file)) = theme_rest.split_once('/') else {
+            return false;
+        };
+        return !dir.is_empty()
+            && !file.contains('/')
+            && matches!(file, "theme.css" | "manifest.json");
+    }
+    false
+}
+
 fn validate_segments(path: &str, allow_ascii_upper: bool) -> bool {
     if path.is_empty() || path.len() > KEY_MAX_BYTES || path.starts_with('/') {
         return false;
@@ -116,16 +143,17 @@ fn validate_segments(path: &str, allow_ascii_upper: bool) -> bool {
     if !allow_ascii_upper && path.bytes().any(|b| b.is_ascii_uppercase()) {
         return false;
     }
-    if path == ".obsidian"
-        || path == ".trash"
-        || path.starts_with(".obsidian/")
-        || path.starts_with(".trash/")
-    {
+    if path == ".trash" || path.starts_with(".trash/") {
         return false;
     }
     let mut last = None;
     for segment in path.split('/') {
         if segment.is_empty() || segment == "." || segment == ".." {
+            return false;
+        }
+        // Windows separator in a POSIX segment could escape the allowlist
+        // (e.g. snippets/a\..\plugins\...). Reject in every segment.
+        if segment.contains('\\') {
             return false;
         }
         if segment.ends_with(' ') || segment.ends_with('.') {
@@ -136,15 +164,20 @@ fn validate_segments(path: &str, allow_ascii_upper: bool) -> bool {
     let Some(last) = last else {
         return false;
     };
+    if path == ".obsidian" || path.starts_with(".obsidian/") {
+        return obsidian_allowlisted(path);
+    }
     let Some(ext) = last_extension(last) else {
         return false;
     };
     type_cap_for_ext(&ext.to_ascii_lowercase()).is_some()
 }
 
-/// Structural-only path-key check. Unicode folding is the client's job; this
-/// crate has no Unicode dependency and only rejects ASCII-uppercase as a cheap
-/// sanity check that the key arrived casefolded.
+/// Structural-only path-key check. Client keys arrive full-casefolded
+/// (Unicode C+F) after NFC, not merely lowercased; this crate has no Unicode
+/// dependency and only rejects ASCII-uppercase as a cheap sanity check that
+/// the key arrived casefolded. For the ASCII allowlist literals this is
+/// equivalent to lowercase.
 pub fn validate_blob_key(key: &str) -> bool {
     validate_segments(key, false)
 }
@@ -156,6 +189,9 @@ fn validate_display_path(path: &str) -> bool {
 }
 
 fn cap_for_key(key: &str) -> Option<u64> {
+    if obsidian_allowlisted(key) {
+        return Some(OBSIDIAN_CAP);
+    }
     let last = key.rsplit('/').next()?;
     let ext = last_extension(last)?;
     type_cap_for_ext(&ext.to_ascii_lowercase())

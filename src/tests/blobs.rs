@@ -158,6 +158,42 @@ fn test_validate_blob_key_rejects_null_vectors() {
     assert_eq!(nulls, 8);
 }
 
+#[test]
+fn test_validate_blob_key_obsidian_allowlist() {
+    // json/css stay off the 19-extension attachment whitelist.
+    assert_eq!(type_cap_for_ext("json"), None);
+    assert_eq!(type_cap_for_ext("css"), None);
+
+    for key in [
+        ".obsidian/app.json",
+        ".obsidian/appearance.json",
+        ".obsidian/snippets/wide.css",
+        ".obsidian/themes/minimal/theme.css",
+        ".obsidian/themes/minimal/manifest.json",
+        ".obsidian/themes/über/theme.css",
+        ".obsidian/themes/über/manifest.json",
+    ] {
+        assert!(validate_blob_key(key), "expected accept for {key:?}");
+    }
+    for key in [
+        ".obsidian/workspace.json",
+        ".obsidian/workspace-mobile.json",
+        ".obsidian/plugins",
+        ".obsidian/plugins/x",
+        ".obsidian/plugins/vaultcrdt/data.json",
+        "foo.json",
+        "x.css",
+        ".obsidian/snippets/nested/dir.css",
+        ".obsidian/themes/minimal/styles.css",
+        ".obsidian/a.png",
+        ".Obsidian/a.png",
+        ".obsidian/snippets/a\\..\\plugins\\vaultcrdt\\x.css",
+        "pics/a\\b.png",
+    ] {
+        assert!(!validate_blob_key(key), "expected reject for {key:?}");
+    }
+}
+
 #[tokio::test]
 async fn test_blob_happy_path_file_get_and_range() {
     let (app, state, _dir, token) = setup().await;
@@ -497,6 +533,31 @@ async fn test_blob_type_cap_and_segment_body_limit() {
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn test_obsidian_type_cap() {
+    let (app, _state, _dir, token) = setup().await;
+    let (status, body) = json_call(
+        &app,
+        "POST",
+        "/vault/blob-paths",
+        &token,
+        Some(json!({
+            "path_key": ".obsidian/app.json",
+            "display_path": ".obsidian/app.json",
+            "key_version": 1,
+            "generation": 1,
+            "state": "live",
+            "content_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "size": 2 * 1024 * 1024 + 1,
+            "peer_id": "p",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert_eq!(body["error"], "type_cap_exceeded");
+    assert_eq!(body["max_bytes"], 2 * 1024 * 1024);
 }
 
 #[tokio::test]
