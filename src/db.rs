@@ -404,6 +404,14 @@ fn content_hash_from_snapshot_blob(snapshot_blob: &[u8]) -> Option<String> {
 /// Captures `content_hash` from the snapshot *before* the row is deleted.
 /// NULL if there is no document row or text extraction fails; the delete
 /// itself still succeeds.
+///
+/// A replayed/late delete for an already-tombstoned path carries no snapshot
+/// (the document row is gone). `ON CONFLICT` therefore uses
+/// `COALESCE(excluded.content_hash, tombstones.content_hash)` so a NULL
+/// incoming hash cannot clobber the hash captured at the original delete —
+/// that hash is the proof basis for client keep-guards (`tombstone_hashes`
+/// in `doc_list`). Observed 2026-09-07 T2: a replayed `doc_delete` overwrote
+/// a valid captured hash with NULL.
 pub async fn delete_doc_and_tombstone(
     db: &Db,
     vault_id: &str,
@@ -431,7 +439,7 @@ pub async fn delete_doc_and_tombstone(
          ON CONFLICT(vault_id, doc_uuid) DO UPDATE SET \
            deleted_by = excluded.deleted_by, \
            deleted_at = datetime('now'), \
-           content_hash = excluded.content_hash",
+           content_hash = COALESCE(excluded.content_hash, tombstones.content_hash)",
         params![vault_id, doc_uuid, deleted_by, content_hash],
     )?;
     tx.commit()?;

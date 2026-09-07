@@ -1878,6 +1878,93 @@ async fn test_delete_without_document_row_stores_null_hash() {
 }
 
 #[tokio::test]
+async fn test_replayed_delete_preserves_captured_hash() {
+    use crate::handlers::process_message;
+    use crate::ws::msg;
+
+    let db = test_db().await;
+    db::create_vault(&db, "v", "k").await.unwrap();
+    let doc_locks = DocLocks::default();
+
+    let (snapshot, vv) = loro_snapshot_with_content("vaultcrdt fnv golden");
+    db::store_snapshot_with_vv(&db, "v", "note.md", &snapshot, &vv)
+        .await
+        .unwrap();
+
+    db::delete_doc_and_tombstone(&db, "v", "note.md", "peer-1")
+        .await
+        .unwrap();
+    let first = db::list_tombstones_with_hash(&db, "v").await.unwrap();
+    assert_eq!(first[0].content_hash.as_deref(), Some("a6a9b25f2a464e61"));
+
+    exec(
+        &db,
+        "UPDATE tombstones SET deleted_at = '2000-01-01 00:00:00' WHERE doc_uuid = 'note.md'",
+    )
+    .await;
+
+    // Replay: document row is already gone — hash must survive.
+    db::delete_doc_and_tombstone(&db, "v", "note.md", "peer-2")
+        .await
+        .unwrap();
+
+    let deleted_by: String = scalar(
+        &db,
+        "SELECT deleted_by FROM tombstones WHERE doc_uuid = 'note.md'",
+    )
+    .await;
+    let deleted_at: String = scalar(
+        &db,
+        "SELECT deleted_at FROM tombstones WHERE doc_uuid = 'note.md'",
+    )
+    .await;
+    assert_eq!(deleted_by, "peer-2");
+    assert_ne!(deleted_at, "2000-01-01 00:00:00");
+
+    let hashes = db::list_tombstones_with_hash(&db, "v").await.unwrap();
+    assert_eq!(hashes.len(), 1);
+    assert_eq!(hashes[0].content_hash.as_deref(), Some("a6a9b25f2a464e61"));
+
+    let req = rmp_serde::to_vec_named(&msg::ClientMsg::RequestDocList).unwrap();
+    let (resp, _) = process_message(&req, &db, "v", 1, &doc_locks).await;
+    match resp {
+        msg::ServerMsg::DocList {
+            tombstone_hashes, ..
+        } => {
+            assert_eq!(tombstone_hashes.len(), 1);
+            assert_eq!(tombstone_hashes[0].doc_uuid, "note.md");
+            assert_eq!(
+                tombstone_hashes[0].content_hash.as_deref(),
+                Some("a6a9b25f2a464e61")
+            );
+        }
+        other => panic!("expected DocList, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_replayed_delete_never_existed_hash_stays_null() {
+    let db = test_db().await;
+    db::delete_doc_and_tombstone(&db, "v", "ghost.md", "peer-1")
+        .await
+        .unwrap();
+    db::delete_doc_and_tombstone(&db, "v", "ghost.md", "peer-2")
+        .await
+        .unwrap();
+
+    let hashes = db::list_tombstones_with_hash(&db, "v").await.unwrap();
+    assert_eq!(hashes.len(), 1);
+    assert_eq!(hashes[0].doc_uuid, "ghost.md");
+    assert_eq!(hashes[0].content_hash, None);
+    let deleted_by: String = scalar(
+        &db,
+        "SELECT deleted_by FROM tombstones WHERE doc_uuid = 'ghost.md'",
+    )
+    .await;
+    assert_eq!(deleted_by, "peer-2");
+}
+
+#[tokio::test]
 async fn test_doc_list_tombstone_hashes_and_null_roundtrip() {
     use crate::handlers::process_message;
     use crate::ws::msg;
