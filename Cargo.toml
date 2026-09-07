@@ -44,10 +44,13 @@ argon2          = "0.6.0"
 sha2            = "0.10"
 password-hash   = { version = "0.6.1", features = ["phc"] }
 blake3          = "1.8"
+# svg-hush: protocol-pinned; upgrade = protocol event, both repos in lockstep
+svg-hush        = "=0.9.7"
 
 [dev-dependencies]
 tower             = "0.5"
 tokio-tungstenite = "0.29"
+base64            = "0.22"
 
 [profile.release]
 opt-level = 3

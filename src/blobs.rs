@@ -10,7 +10,7 @@ use futures_util::StreamExt;
 use rusqlite::{OptionalExtension, params};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::io::SeekFrom;
+use std::io::{Cursor, SeekFrom};
 use std::path::{Path as FsPath, PathBuf};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
@@ -42,12 +42,62 @@ fn is_hash(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-fn type_cap_for_ext(ext: &str) -> Option<u64> {
+pub(crate) fn type_cap_for_ext(ext: &str) -> Option<u64> {
     match ext {
-        "jpg" | "jpeg" | "png" | "webp" | "gif" | "heic" | "heif" | "avif" => Some(IMAGE_CAP),
+        "jpg" | "jpeg" | "png" | "webp" | "gif" | "heic" | "heif" | "avif" | "svg" => {
+            Some(IMAGE_CAP)
+        }
         "pdf" => Some(PDF_CAP),
         "mp3" | "m4a" | "ogg" | "oga" | "opus" | "flac" | "wav" | "webm" | "3gp" => Some(AUDIO_CAP),
         _ => None,
+    }
+}
+
+/// Shared protocol Filter. Bytes are never rewritten on disk; callers reject
+/// unless the input is already a fixpoint of this filter.
+pub(crate) fn svg_filter_output(bytes: &[u8]) -> Result<Vec<u8>, svg_hush::FError> {
+    let mut f = svg_hush::Filter::new();
+    f.set_data_url_filter(svg_hush::data_url_filter::allow_standard_images);
+    let mut out = Vec::new();
+    f.filter(Cursor::new(bytes), &mut out)?;
+    Ok(out)
+}
+
+pub(crate) fn svg_at_fixpoint(bytes: &[u8]) -> Result<bool, svg_hush::FError> {
+    Ok(svg_filter_output(bytes)? == bytes)
+}
+
+/// Cheap sniff: first non-BOM, non-ASCII-whitespace byte is `<`, and
+/// case-sensitive `<svg` plus a delimiter appears in the first 4096 bytes.
+pub(crate) fn looks_like_svg(bytes: &[u8]) -> bool {
+    let mut i = 0;
+    if bytes.len() >= 3 && bytes[..3] == [0xEF, 0xBB, 0xBF] {
+        i = 3;
+    }
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= bytes.len() || bytes[i] != b'<' {
+        return false;
+    }
+    let window = &bytes[..bytes.len().min(4096)];
+    let mut n = 0;
+    while n + 5 <= window.len() {
+        if &window[n..n + 4] == b"<svg"
+            && matches!(window[n + 4], b' ' | b'>' | b'/' | b'\t' | b'\n' | b'\r')
+        {
+            return true;
+        }
+        n += 1;
+    }
+    false
+}
+
+fn svg_fixpoint_error(bytes: &[u8]) -> Option<&'static str> {
+    match svg_at_fixpoint(bytes) {
+        Ok(true) => None,
+        Ok(false) => Some("svg_not_sanitized"),
+        Err(_) => Some("svg_invalid"),
     }
 }
 
@@ -209,20 +259,6 @@ fn parse_byte_range(header: &str, total: u64) -> Result<Option<(u64, u64)>, ()> 
         (start, end.min(total - 1))
     };
     Ok(Some((start, end)))
-}
-
-async fn blake3_file_hex(path: &FsPath) -> Result<String, std::io::Error> {
-    let mut file = tokio::fs::File::open(path).await?;
-    let mut hasher = blake3::Hasher::new();
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let n = file.read(&mut buf).await?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(hasher.finalize().to_hex().to_string())
 }
 
 #[derive(Deserialize)]
@@ -544,12 +580,27 @@ pub async fn put_upload(
         ));
     }
 
-    let digest = blake3_file_hex(&tmp).await?;
+    let bytes = tokio::fs::read(&tmp).await?;
+    let digest = blake3::hash(&bytes).to_hex().to_string();
     if digest != row.hash_claimed {
         discard_upload(&state.db, &state.blob_dir, &vault_id, &upload_id).await;
         return Ok(json_error(
             StatusCode::UNPROCESSABLE_ENTITY,
             json!({"error": "hash_mismatch"}),
+        ));
+    }
+    if looks_like_svg(&bytes)
+        && let Some(kind) = svg_fixpoint_error(&bytes)
+    {
+        tracing::warn!(
+            hash = %row.hash_claimed,
+            error = kind,
+            "svg rejected at upload finalize"
+        );
+        discard_upload(&state.db, &state.blob_dir, &vault_id, &upload_id).await;
+        return Ok(json_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            json!({"error": kind}),
         ));
     }
 
@@ -949,6 +1000,35 @@ pub async fn post_blob_path(
             return Ok(json_error(
                 StatusCode::PRECONDITION_FAILED,
                 json!({"error": "blob not uploaded"}),
+            ));
+        }
+    }
+
+    if body.state == "live"
+        && last_extension(&body.path_key) == Some("svg")
+        && let Some(ref hash) = body.content_hash
+    {
+        let path = blob_file_path(&state.blob_dir, &vault_id, hash);
+        let bytes = match tokio::fs::read(&path).await {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(json_error(
+                    StatusCode::PRECONDITION_FAILED,
+                    json!({"error": "blob not uploaded"}),
+                ));
+            }
+            Err(e) => return Err(e.into()),
+        };
+        if let Some(kind) = svg_fixpoint_error(&bytes) {
+            tracing::warn!(
+                hash = %hash,
+                path_key = %body.path_key,
+                error = kind,
+                "svg rejected at path attach"
+            );
+            return Ok(json_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                json!({"error": kind}),
             ));
         }
     }

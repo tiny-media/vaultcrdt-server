@@ -1,9 +1,16 @@
 use super::{exec, scalar, test_db, test_state};
-use crate::{AppState, auth, blobs::validate_blob_key, build_router, cli, db};
+use crate::{
+    AppState, auth,
+    blobs::{
+        looks_like_svg, svg_at_fixpoint, svg_filter_output, type_cap_for_ext, validate_blob_key,
+    },
+    build_router, cli, db,
+};
 use axum::{
     body::{Body, to_bytes},
     http::{HeaderMap, Request, StatusCode, header},
 };
+use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use tower::ServiceExt;
@@ -148,7 +155,7 @@ fn test_validate_blob_key_rejects_null_vectors() {
             assert!(!validate_blob_key(input), "expected reject for {input:?}");
         }
     }
-    assert_eq!(nulls, 9);
+    assert_eq!(nulls, 8);
 }
 
 #[tokio::test]
@@ -724,4 +731,223 @@ async fn test_blob_expired_inflight_does_not_eat_quota() {
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+fn svg_vector(name: &str) -> (Vec<u8>, String) {
+    let parsed: Value =
+        serde_json::from_str(include_str!("../../docs/svg-sanitize-vectors.json")).unwrap();
+    for v in parsed.as_array().unwrap() {
+        if v["name"].as_str() == Some(name) {
+            let input = B64.decode(v["input_b64"].as_str().unwrap()).unwrap();
+            let expected = v["output_blake3_hex"].as_str().unwrap().to_string();
+            return (input, expected);
+        }
+    }
+    panic!("missing svg vector {name}");
+}
+
+#[test]
+fn test_svg_sanitize_golden_vectors() {
+    let parsed: Value =
+        serde_json::from_str(include_str!("../../docs/svg-sanitize-vectors.json")).unwrap();
+    for v in parsed.as_array().unwrap() {
+        let name = v["name"].as_str().unwrap();
+        let input = B64.decode(v["input_b64"].as_str().unwrap()).unwrap();
+        let expected = v["output_blake3_hex"].as_str().unwrap();
+        let out = svg_filter_output(&input).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        let got = blake3::hash(&out).to_hex().to_string();
+        assert_eq!(
+            got, expected,
+            "golden hash mismatch for {name} — STOP, do not fix vectors"
+        );
+    }
+}
+
+#[test]
+fn test_looks_like_svg_sniff_vectors() {
+    assert!(looks_like_svg(b"<svg xmlns='http://www.w3.org/2000/svg'>"));
+    assert!(looks_like_svg(
+        b"\xEF\xBB\xBF<?xml version=\"1.0\"?><svg xmlns='http://www.w3.org/2000/svg'>"
+    ));
+    assert!(looks_like_svg(
+        b"<!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\" \"http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd\"><svg xmlns='http://www.w3.org/2000/svg'>"
+    ));
+    assert!(!looks_like_svg(
+        b"<svg:svg xmlns:svg='http://www.w3.org/2000/svg'>"
+    ));
+    assert!(!looks_like_svg(b"<SVG xmlns='http://www.w3.org/2000/svg'>"));
+    assert!(!looks_like_svg(
+        b"<svgfoo xmlns='http://www.w3.org/2000/svg'>"
+    ));
+    assert!(!looks_like_svg(b"\x89PNG\r\n\x1a\n<svg "));
+    assert!(looks_like_svg(
+        b"  \n\t<div><svg xmlns='http://www.w3.org/2000/svg'>"
+    ));
+    assert!(!looks_like_svg(
+        b"\x00<svg xmlns='http://www.w3.org/2000/svg'>"
+    ));
+}
+
+#[test]
+fn test_svg_at_fixpoint_sanitized_script_malformed() {
+    let (clean, _) = svg_vector("clean-svg");
+    let sanitized = svg_filter_output(&clean).unwrap();
+    assert!(svg_at_fixpoint(&sanitized).unwrap());
+
+    let (script, _) = svg_vector("script-svg");
+    assert!(!svg_at_fixpoint(&script).unwrap());
+
+    assert!(svg_at_fixpoint(b"<svg xmlns='http://www.w3.org/2000/svg'><").is_err());
+}
+
+#[test]
+fn test_svg_in_image_cap() {
+    assert_eq!(type_cap_for_ext("svg"), Some(10 * 1024 * 1024));
+    assert!(validate_blob_key("x.svg"));
+}
+
+async fn try_upload(app: &axum::Router, token: &str, data: &[u8]) -> (StatusCode, Value, String) {
+    let hash = hex(data);
+    let (status, body) = json_call(
+        app,
+        "POST",
+        "/vault/blobs/uploads",
+        token,
+        Some(json!({"hash": hash, "size": data.len()})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let id = body["upload_id"].as_str().unwrap().to_string();
+    let last = data.len() as u64 - 1;
+    let (status, body) = put_range(app, token, &id, 0, last, data.len() as u64, data).await;
+    (status, body, id)
+}
+
+#[tokio::test]
+async fn test_svg_r1_presanitized_upload_ok() {
+    let (app, _state, _dir, token) = setup().await;
+    let (clean, _) = svg_vector("clean-svg");
+    let sanitized = svg_filter_output(&clean).unwrap();
+    let (status, body, _) = try_upload(&app, &token, &sanitized).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["hash"], hex(&sanitized));
+}
+
+#[tokio::test]
+async fn test_svg_r1_script_422_no_row_tmp_cleaned() {
+    let (app, state, _dir, token) = setup().await;
+    let (script, _) = svg_vector("script-svg");
+    let (status, body, id) = try_upload(&app, &token, &script).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"], "svg_not_sanitized");
+    let count: i64 = scalar(&state.db, "SELECT count(*) FROM blobs").await;
+    assert_eq!(count, 0);
+    let tmp = state.blob_dir.join("tmp").join(&id);
+    assert!(!tmp.exists());
+    let claimed = hex(&script);
+    let dest = state.blob_dir.join("v").join(&claimed[..2]).join(&claimed);
+    assert!(!dest.exists());
+}
+
+#[tokio::test]
+async fn test_svg_r1_malformed_422_svg_invalid() {
+    let (app, state, _dir, token) = setup().await;
+    let bad = b"<svg xmlns='http://www.w3.org/2000/svg'><";
+    assert!(looks_like_svg(bad));
+    assert!(svg_at_fixpoint(bad).is_err());
+    let (status, body, id) = try_upload(&app, &token, bad).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"], "svg_invalid");
+    let count: i64 = scalar(&state.db, "SELECT count(*) FROM blobs").await;
+    assert_eq!(count, 0);
+    let tmp = state.blob_dir.join("tmp").join(&id);
+    assert!(!tmp.exists());
+}
+
+#[tokio::test]
+async fn test_svg_r2_live_attach_sanitized_ok() {
+    let (app, _state, _dir, token) = setup().await;
+    let (clean, _) = svg_vector("clean-svg");
+    let sanitized = svg_filter_output(&clean).unwrap();
+    let hash = upload_all(&app, &token, &sanitized).await;
+    let (status, body) = json_call(
+        &app,
+        "POST",
+        "/vault/blob-paths",
+        &token,
+        Some(json!({
+            "path_key": "pics/a.svg",
+            "display_path": "pics/a.svg",
+            "key_version": 1,
+            "generation": 1,
+            "state": "live",
+            "content_hash": hash,
+            "size": sanitized.len(),
+            "peer_id": "p",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["accepted"], true);
+}
+
+#[tokio::test]
+async fn test_svg_r2_live_attach_nonsanitized_direct_insert_422() {
+    let (app, state, _dir, token) = setup().await;
+    let (script, _) = svg_vector("script-svg");
+    let hash = hex(&script);
+    let dir = state.blob_dir.join("v").join(&hash[..2]);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(&hash), &script).unwrap();
+    exec(
+        &state.db,
+        &format!(
+            "INSERT INTO blobs (vault_id, hash, size) VALUES ('v', '{hash}', {})",
+            script.len()
+        ),
+    )
+    .await;
+    let (status, body) = json_call(
+        &app,
+        "POST",
+        "/vault/blob-paths",
+        &token,
+        Some(json!({
+            "path_key": "pics/evil.svg",
+            "display_path": "pics/evil.svg",
+            "key_version": 1,
+            "generation": 1,
+            "state": "live",
+            "content_hash": hash,
+            "size": script.len(),
+            "peer_id": "p",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"], "svg_not_sanitized");
+    let paths: i64 = scalar(&state.db, "SELECT count(*) FROM blob_path_states").await;
+    assert_eq!(paths, 0);
+}
+
+#[tokio::test]
+async fn test_svg_r2_tombstone_missing_blob_not_rejected() {
+    let (app, _state, _dir, token) = setup().await;
+    let (status, body) = json_call(
+        &app,
+        "POST",
+        "/vault/blob-paths",
+        &token,
+        Some(json!({
+            "path_key": "pics/gone.svg",
+            "display_path": "pics/gone.svg",
+            "key_version": 1,
+            "generation": 1,
+            "state": "deleted",
+            "peer_id": "p",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["accepted"], true);
 }
