@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-09-07
+
+### Added
+
+- SVG verification for the blob lane: upload finalize and live path
+  attach reject SVGs unless svg-hush (protocol-pinned 0.9.7) reports a
+  fixpoint; bytes are never rewritten. SVG joins the 10 MiB image cap.
+- Tombstone content hashes: doc_list gains an additive tombstone_hashes
+  field (fnv1a-64 over UTF-16 code units, captured at delete time,
+  migration 005) so reconnecting clients can prove a local file matches
+  the deleted server version.
+- .obsidian category allowlist in the blob lane: app.json,
+  appearance.json, snippets/*.css and themes/<name>/{theme.css,
+  manifest.json} sync with a 2 MiB cap; everything else under .obsidian
+  stays blocked. Backslash segments are rejected everywhere.
+
 ## [0.4.0] - 2026-09-07
 
 ### Added
