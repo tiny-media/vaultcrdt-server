@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-09-07
+
+### Fixed
+
+- Repeated or replayed deletes no longer wipe a tombstone's captured
+  content hash (COALESCE keeps the original; deleted_by/deleted_at
+  still update).
+
+### Added
+
+- The doc_deleted broadcast carries the tombstone's content hash so
+  clients can run the authoritative keep proof in the live path.
+  Additive field; old clients ignore it.
+
 ### Added
 
 - `doc_deleted` broadcasts carry additive `content_hash` (captured at
