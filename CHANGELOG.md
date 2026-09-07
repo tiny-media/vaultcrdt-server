@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-07
+
+### Added
+
+- Attachment blob lane: content-addressed store (blake3, per-vault
+  dedup) behind the existing vault auth. Chunked resumable uploads with
+  offset and hash verification, range-serving downloads, last-writer-wins
+  path states with generations under per-path locks, and a WebSocket
+  wake-up that only reaches connections whose auth frame subscribed to
+  the `blobs` feature (older clients never receive it).
+- Per-vault storage quota, admin-settable via `vault quota NAME BYTES`
+  (default 5 GiB, `0` = unlimited, `default` = server default);
+  enforced at upload creation with 24-hour-bounded in-flight accounting.
+- Attachment whitelist: images, PDF, and audio including `oga`, `webm`
+  and `3gp` for Android OEM recorders. No video, no SVG.
+
 ## [0.3.3] - 2026-09-07
 
 ### Changed
