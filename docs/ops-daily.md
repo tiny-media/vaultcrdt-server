@@ -14,7 +14,7 @@ Placeholders: `$ADMIN_TOKEN` is the value of `VAULTCRDT_ADMIN_TOKEN`; `$VAULT_JW
 curl http://your-server:8080/health
 ```
 
-Expected: HTTP 200 with `{"status":"ok","version":"<server version>","server_epoch":"<uuid>","protocol_version":1}`.
+Expected: HTTP 200 with `{"status":"ok","version":"<server version>","server_epoch":"<uuid>","protocol_version":1,"features":["invite","device_keys","blobs"]}`. This is a liveness and capability response, not a database or blob integrity check.
 
 ### Logs
 
@@ -38,7 +38,7 @@ ls -lh ./data/data.db
 docker compose exec server ls -lh /var/lib/vaultcrdt/data.db
 ```
 
-Growth of tens to a few hundred KB per day per active vault is normal. A jump without a matching change in usage points to a sync loop or oversized payloads; check the logs.
+Compare growth with this instance's baseline and editing activity. A jump without a matching change in usage may point to a sync loop or oversized payloads; check the logs. Blob bytes live separately in `./data/blobs/` with the default configuration; include that directory when reviewing disk usage.
 
 ### Vaults and connections
 
@@ -53,7 +53,9 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
 
 ### Backup
 
-`.backup` is safe while the server runs. Run it inside the container, then move the file off the host and check it.
+A complete backup needs both SQLite and the blob directory (`VAULTCRDT_BLOB_DIR`, default `/var/lib/vaultcrdt/blobs`). For a consistent full backup with the shipped paths, stop the server, copy all of `./data/` (including any WAL/SHM files and `blobs/`) off the host, then start it again. If paths are customized, include both storage locations.
+
+The following `.backup` is safe while the server runs, but backs up **only SQLite**, not attachment bytes. It is not a complete vault backup. Move the file off the host and check it:
 
 ```bash
 docker compose exec server \
@@ -98,13 +100,15 @@ curl -X DELETE \
   "http://your-server:8080/vault/peers/PEER_ID?vault_id=my-vault&device_name=My%20Laptop"
 ```
 
-`409`: name mismatch; the body contains the stored `device_name` and `last_seen_at`, nothing was deleted. `200`: peer removed; `tombstones_possibly_freed` is an upper bound of tombstones this peer was blocking.
+`409`: name mismatch; the body contains the stored `device_name` and `last_seen_at`, nothing was deleted. `200`: peer removed and its device key revoked; `tombstones_possibly_freed` is an upper bound of tombstones this peer was blocking. Already-issued JWTs remain valid until expiry; retirement does not close an existing WebSocket.
 
 ### Tombstones
 
 ```bash
 sqlite3 ./data/data.db "SELECT vault_id, COUNT(*) FROM tombstones GROUP BY vault_id;"
 ```
+
+Note tombstones retain a nullable content hash captured before deletion; replayed deletes preserve an existing hash. Legacy rows can have null hashes. These hashes are separate from attachment BLAKE3 hashes.
 
 Tombstones expire after `VAULTCRDT_TOMBSTONE_DAYS` (default 365) unless a retained peer has `last_seen_at <= deleted_at`. A large count is expected after a bulk delete or an onboarding that trashed many notes. A count that never shrinks after 365 days points to an old peer row blocking expiry; see [Peers](#peers).
 
@@ -166,7 +170,7 @@ Alternative without a container: `sqlite3 ./data/data.db "VACUUM; ANALYZE;"` on 
 
 ### Restore drill
 
-Pick a backup from two to three months back and verify it can be restored.
+Pick a full backup from two to three months back and verify it can be restored. The commands below check the SQLite portion; also restore the matching blob directory to `/tmp/restore-test/blobs` and verify attachment retrieval with a test client. A successful database integrity check alone does not verify attachments.
 
 ```bash
 mkdir -p /tmp/restore-test
@@ -180,11 +184,12 @@ SELECT COUNT(*) FROM peers;
 EOF
 ```
 
-Boot a throwaway instance against the copy. Use a different port and DB path so the live server and its database are not touched. Dummy secrets are sufficient for a boot and `/health` check; the live values are needed only to query authenticated endpoints.
+Boot a throwaway instance against the copy. Use a different port, DB path and blob directory so live storage is not touched. Set `$JWT_SECRET` and `$ADMIN_TOKEN` to throwaway drill secrets; live server secrets are not needed for these checks. Do not connect production clients.
 
 ```bash
 VAULTCRDT_DB_PATH=/tmp/restore-test/data.db \
   VAULTCRDT_BIND=127.0.0.1:18080 \
+  VAULTCRDT_BLOB_DIR=/tmp/restore-test/blobs \
   VAULTCRDT_JWT_SECRET="$JWT_SECRET" \
   VAULTCRDT_ADMIN_TOKEN="$ADMIN_TOKEN" \
   ./target/release/vaultcrdt-server &
@@ -217,7 +222,7 @@ openssl rand -hex 32   # new VAULTCRDT_JWT_SECRET
 openssl rand -hex 32   # new VAULTCRDT_ADMIN_TOKEN
 ```
 
-Update `.env`, then `docker compose restart server`. Vault JWTs signed with the old secret are rejected from the restart on; clients re-authenticate with vault name and password. Tokens expire after 3600 s (`JWT_EXPIRY_SECS`, `src/auth.rs`).
+Update `.env`, then run `docker compose up -d --force-recreate server` so the changed environment takes effect; a restart alone does not reload it. Vault JWTs signed with the old secret are rejected from then on; clients re-authenticate with device keys or vault name and password. Tokens expire after 3600 s (`JWT_EXPIRY_SECS`, `src/auth.rs`).
 
 ## Recovery
 
@@ -238,14 +243,7 @@ df -h ./data
 ls -la ./data/
 ```
 
-Last resort, restore from the newest backup (see README, "Restore", for the client-side consequences):
-
-```bash
-docker compose stop server
-rm -f ./data/data.db ./data/data.db-wal ./data/data.db-shm
-cp /path/to/backup/vaultcrdt-latest.db ./data/data.db
-docker compose start server
-```
+Last resort, pause clients and restore the newest matching database and blob backup while the server is stopped (see [README — Restore](../README.md#restore) for client-side consequences). Keep a copy of the failed state first. Replace the complete data directory from a cold backup, or restore a standalone SQLite backup without stale working WAL/SHM files alongside its matching blob directory. Preserve ownership so the container user can read and write the restored files.
 
 ### Suspected corruption
 
@@ -253,13 +251,15 @@ docker compose start server
 docker compose exec server sqlite3 /var/lib/vaultcrdt/data.db "PRAGMA integrity_check;"
 ```
 
-On errors: restore from the newest backup that passes `integrity_check`, then tell vault users to check for conflict copies after their next sync.
+On errors: restore from the newest matching database and blob backup whose database passes `integrity_check`, then tell vault users to check for conflict copies and missing attachments after their next sync.
 
 ### Disk usage
 
 ```bash
 du -h ./data/
 ```
+
+Blob files and upload staging can also dominate disk use; database maintenance does not reclaim their space. Do not delete hash files by hand based only on their age.
 
 If `data.db` dominates: run a manual `VACUUM` (above). If `data.db-wal` is large: the weekly maintenance truncates it; to force it now, stop the server and run `sqlite3 ./data/data.db "PRAGMA wal_checkpoint(TRUNCATE);"`.
 

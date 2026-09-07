@@ -1,8 +1,8 @@
 # VaultCRDT — Architecture and sync reference
 
-Server v0.3.1 · Loro 1.16 (lockstep with the plugin) · Rust 1.95 · SQLite 3.53.2 (bundled) · protocol version 1.
+Server v0.4.2 · Loro 1.16 (lockstep with the plugin) · Rust 1.95 minimum (local toolchain 1.98.1) · SQLite 3.53.2 (bundled) · protocol version 1.
 
-Self-hosted CRDT sync for Obsidian. The server is a passive merger: it holds one Loro document per note, merges client deltas, stores the snapshot, and forwards the client's delta to the other connected clients of the same vault. It has no knowledge of note text beyond the Loro binary.
+Self-hosted CRDT sync for Obsidian. The server is a passive merger: it holds one Loro document per note, merges client deltas, stores the snapshot, and forwards the client's delta to the other connected clients of the same vault. The Loro binary is not encrypted: the server can read note text and extracts it to hash deleted content. Attachments use a separate blob lane.
 
 Plugin-side sections (event wiring, echo suppression, conflict files) describe the client as designed together with this protocol; the plugin repository is the source of truth for its current code.
 
@@ -76,14 +76,20 @@ MessagePack over WebSocket. Messages are tagged enums (`#[serde(tag = "type", re
 
 | Route | Auth | Purpose |
 |---|---|---|
-| `GET /health` | none | `{status, version, server_epoch, protocol_version}` |
+| `GET /health` | none | `{status, version, server_epoch, protocol_version, features}`; features: `invite`, `device_keys`, `blobs` |
 | `POST /auth/verify` | body | `{vault_id, api_key, admin_token?}` → `{token, vault_id}` |
 | `GET /ws` | first WS message | sync connection |
 | `POST /invite` | vault JWT | create a 15-minute single-use invite for a new device |
 | `POST /invite/redeem` | invite token | redeem invite → device key |
 | `POST /auth/device` | device key | device key → vault JWT |
 | `GET /vault/peers` | vault JWT | peer list of the vault |
-| `DELETE /vault/peers/{peer_id}` | admin token | retire one peer (see README) |
+| `DELETE /vault/peers/{peer_id}` | admin token | retire one peer and revoke its device key (see [operations](ops-daily.md#peers)) |
+| `POST /vault/blobs/uploads` | vault JWT | start a resumable upload |
+| `PUT /vault/blobs/uploads/{upload_id}` | vault JWT | upload a segment |
+| `GET /vault/blobs/uploads/{upload_id}` | vault JWT | upload status |
+| `GET /vault/blobs/{hash}` | vault JWT | download a blob |
+| `POST /vault/blob-paths` | vault JWT | submit a blob path state |
+| `GET /vault/blob-paths` | vault JWT | list blob path states |
 | `GET /debug/vault-stats` | vault JWT | doc count, snapshot bytes, largest docs |
 | `GET /debug/connections` | admin token | open WS connections |
 
@@ -95,7 +101,7 @@ MessagePack over WebSocket. Messages are tagged enums (`#[serde(tag = "type", re
 
 Auth errors are generic. The response does not reveal whether a vault exists. `vault_id` is lowercase letters, digits, `-`, `_`; starts with a letter or digit; at most 64 bytes.
 
-`/auth/verify` and the invite routes are rate limited per client address (10 requests per 60 s window; the limiter fails closed above 65 536 tracked keys). The key is the socket address. When `VAULTCRDT_TRUST_PROXY` is set, the server reads the client address from the header set by a reverse proxy with TLS in front instead. Off by default.
+`/auth/verify`, the invite routes and `/auth/device` are rate limited per client IP (10 requests per 60 s window; the limiter fails closed above 65 536 tracked keys). By default the key is the socket IP. With `VAULTCRDT_TRUST_PROXY` enabled, the server uses `CF-Connecting-IP` when present, otherwise the socket IP; it does not use `X-Forwarded-For`. Enable this only behind a trusted proxy that controls the header.
 
 ### JWT and `VaultAuth`
 
@@ -123,7 +129,7 @@ Client → server:
 
 | Type | Fields | Purpose |
 |---|---|---|
-| `auth` | `token`, `protocol_version` | first message |
+| `auth` | `token`, `protocol_version`, `features?` | first message; include `"blobs"` to receive blob notifications |
 | `ping` | — | heartbeat |
 | `request_doc_list` | — | all server docs and tombstones |
 | `sync_start` | `doc_uuid`, `client_vv?` | request delta since client VV (`null` = full snapshot) |
@@ -139,13 +145,14 @@ Server → client:
 | `pong` | — | heartbeat reply |
 | `ack` | — | push/create/delete accepted |
 | `error` | `code`, `message` | error |
-| `doc_list` | `docs: [{doc_uuid, updated_at, server_vv}]`, `tombstones: [doc_uuid]` | reply to `request_doc_list` |
+| `doc_list` | `docs: [{doc_uuid, updated_at, server_vv}]`, `tombstones: [doc_uuid]`, `tombstone_hashes: [{doc_uuid, content_hash}]` | reply to `request_doc_list`; hashes may be null |
 | `sync_delta` | `doc_uuid`, `delta`, `server_vv` | reply to `sync_start` |
 | `doc_unknown` | `doc_uuid` | server has no such document |
 | `delta_broadcast` | `doc_uuid`, `delta`, `peer_id`, `server_vv` | another client pushed |
 | `doc_deleted` | `doc_uuid`, `content_hash?` | another client deleted |
 | `doc_tombstoned` | `doc_uuid` | push refused: document is tombstoned |
 | `create_conflict` | `doc_uuid` | push/create refused: disjoint history |
+| `blob_path_changed` | `path_key`, `seq` | blob path notification for clients advertising `blobs` |
 
 ### Initial sync
 
@@ -198,7 +205,7 @@ After every `delta_broadcast` the client checks whether its local VV covers `ser
 
 `sync_start`: unknown document → `doc_unknown`; `client_vv` present → `ExportMode::updates(client_vv)`; absent → stored snapshot.
 
-`doc_delete`: removes the document row and writes a tombstone `(vault_id, doc_uuid, deleted_by, deleted_at, content_hash)` — `content_hash` is captured from the snapshot before delete, or kept via `COALESCE` on a re-delete with no document row; broadcasts `doc_deleted` with that hash.
+`doc_delete`: removes the document row and writes a tombstone `(vault_id, doc_uuid, deleted_by, deleted_at, content_hash)` — `content_hash` is captured from the snapshot before delete, or kept via `COALESCE` on a re-delete with no document row; broadcasts `doc_deleted` with that hash. The hash is FNV-1a 64-bit over UTF-16 code units of the Loro `content` text, formatted as 16 lowercase hex characters, not the BLAKE3 hash used for blobs. Missing or unreadable snapshots yield null unless an earlier hash exists. `doc_list.tombstone_hashes` carries the stored hashes alongside the unchanged tombstone ID list; clients should look them up by `doc_uuid`.
 
 `sync_push`, `doc_create` and `doc_delete` on the same `(vault_id, doc_uuid)` are serialised through a per-document async lock (`DocLocks`). The tombstone checks are check-then-act and hold only under this lock.
 
@@ -219,18 +226,25 @@ Tombstones are sticky until retention. There is no server-side resurrection logi
 
 ### Storage
 
-SQLite via `rusqlite (0.40, bundled SQLite 3.53.2)` (bundled SQLite), WAL mode, `synchronous = NORMAL`, `busy_timeout = 5000`, `foreign_keys = ON`. One connection per process behind a `tokio::sync::Mutex` (`db::Db`); call sites take the lock and run the query synchronously. Migrations are embedded (`include_str!` of `migrations/*.sql`, applied by `rusqlite_migration`) and run on startup; the applied count is tracked in `PRAGMA user_version`. Databases created by the previous sqlx runner are adopted once on open: `user_version` is seeded from `_sqlx_migrations`, then that table is dropped.
+SQLite via `rusqlite` 0.40 (bundled SQLite 3.53.2), WAL mode, `synchronous = NORMAL`, `busy_timeout = 5000`, `foreign_keys = ON`. One connection per process behind a `tokio::sync::Mutex` (`db::Db`); call sites take the lock and run the query synchronously. Migrations are embedded (`include_str!` of `migrations/*.sql`, applied by `rusqlite_migration`) and run on startup; the applied count is tracked in `PRAGMA user_version`. Databases created by the previous sqlx runner are adopted once on open: `user_version` is seeded from `_sqlx_migrations`, then that table is dropped.
 
 | Migration | Contents |
 |---|---|
 | `001_init.sql` | `vaults(vault_id PK, api_key, created_at)`, `documents(vault_id, doc_uuid PK, snapshot_blob, vv_blob, updated_at)`, `tombstones(vault_id, doc_uuid PK, deleted_by, deleted_at)` |
 | `002_peers.sql` | `peers(vault_id, peer_id PK, device_name, last_seen_at)` |
 | `003_invites_device_keys.sql` | `invites(id, vault_id, token_hash, inviter_peer_id, device_name, created_at, expires_at, used_at)`, `device_keys(vault_id, peer_id PK, key_hash, device_name, created_at, revoked_at)` |
-| `004` | reserved for the blob (attachment) lane |
+| `004_blob_lane.sql` | `vaults.quota_bytes`, `blobs`, `blob_path_states`, `blob_uploads`, `counters` |
+| `005_tombstone_content_hash.sql` | nullable `tombstones.content_hash`; existing rows remain null |
 
 `vaults.api_key` holds an Argon2id PHC string. Legacy plaintext entries are upgraded on first successful verification.
 
 `documents.snapshot_blob` is `ExportMode::Snapshot`; `documents.vv_blob` is the Loro-native VV encoding (see below).
+
+Blob bytes live outside SQLite at `<VAULTCRDT_BLOB_DIR>/<vault_id>/<hash[0:2]>/<hash>`, addressed by 64-character lowercase BLAKE3 hashes. Upload staging uses `<blob_dir>/tmp/<upload_id>`; the default root is `/var/lib/vaultcrdt/blobs`. SQLite stores metadata and last-writer-wins path states. Backups must include both stores.
+
+Blob caps match the plugin: images (`jpg`, `jpeg`, `png`, `webp`, `gif`, `heic`, `heif`, `avif`, `svg`) and PDFs are limited to 10 MiB; audio (`mp3`, `m4a`, `ogg`, `oga`, `opus`, `flac`, `wav`, `webm`, `3gp`) to 25 MiB. Allowlisted `.obsidian` files are limited to 2 MiB: `.obsidian/app.json`, `.obsidian/appearance.json`, `.obsidian/snippets/<name>.css`, and `.obsidian/themes/<theme>/theme.css` or `manifest.json`. Snippet names and theme directory names are single path segments. Other `.obsidian` paths, including workspace and plugin files, are rejected.
+
+Upload creation enforces the 25 MiB absolute ceiling; type-specific caps are checked when publishing a live blob path. Upload segments are 4 MiB, with at most four open uploads per vault. The default blob quota is 5 GiB per vault (`VAULTCRDT_DEFAULT_VAULT_QUOTA`); `0` means unlimited. SVG bytes must already be a fixpoint of the pinned sanitizer; the server rejects rather than rewrites them.
 
 Invite tokens are 22 characters of URL-safe alphabet, stored as SHA-256, valid for 15 minutes, single use. Device keys are stored as Argon2id hashes; `POST /auth/device` exchanges a device key for a vault JWT.
 
@@ -247,7 +261,8 @@ trust boundary):
   generates and prints a 190-bit secret (argon2id at rest, same policy as
   the HTTP path) and, with `--server-url`, the setup link
   `obsidian://vaultcrdt/setup?v=1&server=…&vaultId=NAME`.
-- `vault list [--json]` — vault ids and creation times.
+- `vault list [--json]` — vault ids, creation times, stored quotas and effective quotas.
+- `vault quota NAME BYTES [--json]` — sets the blob quota; `0` means unlimited, `default` restores the environment default.
 - `invite mint VAULT [--server-url URL] [--json]` — mints a one-use
   invite (15-minute TTL, SHA-256 at rest) via the same code path as the
   HTTP route; the setup link carries the token as `&invite=…`.
@@ -280,7 +295,7 @@ pub fn vv_from_db_bytes(bytes: &[u8]) -> Result<VersionVector, _>;
 
 ### Blob path key v1 (attachment lane, frozen)
 
-The attachment lane (slices S0–S5, design 2026-09-06) uses its own versioned path key. Like the VV serialisation it is a contract frozen on both sides:
+The attachment lane uses its own versioned path key. Like the VV serialisation it is a contract frozen on both sides:
 
 - `path_key = NFC(casefold_full(NFC(path)))`, computed ONLY in the plugin (Rust, `crates/vaultcrdt-core`, WASM export `blob_path_key`).
 - `key_version = 1`. The oracle is `docs/blob-path-key-vectors.json`, which lies identically in BOTH repositories (lockstep rule as for Loro). Its header carries the `unicode_version` (reported by `unicode-normalization` 0.1.25: 17.0.0).
