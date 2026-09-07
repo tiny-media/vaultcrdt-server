@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod blobs;
 pub mod cli;
 pub mod db;
 pub mod errors;
@@ -9,16 +10,17 @@ pub mod ws;
 
 use axum::{
     Json, Router,
-    extract::{ConnectInfo, FromRequest, Path, Query, State},
+    extract::{ConnectInfo, DefaultBodyLimit, FromRequest, Path, Query, State},
     http::{HeaderMap, StatusCode, header, request::Parts},
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
 };
 use db::Db;
 use errors::ServerError;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
@@ -79,6 +81,11 @@ pub enum BroadcastEvent {
         doc_uuid: String,
         sender_conn_id: u64,
     },
+    BlobPathChanged {
+        vault_id: String,
+        path_key: String,
+        seq: i64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -100,6 +107,8 @@ pub struct AppState {
     pub server_epoch: String,
     pub connections: Arc<Mutex<HashMap<u64, ConnectionInfo>>>,
     pub doc_locks: DocLocks,
+    pub blob_dir: PathBuf,
+    pub default_quota_bytes: u64,
 }
 
 // ── VaultAuth extractor ─────────────────────────────────────────────────────
@@ -265,7 +274,7 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         "version": env!("CARGO_PKG_VERSION"),
         "server_epoch": state.server_epoch,
         "protocol_version": ws::PROTOCOL_VERSION,
-        "features": ["invite", "device_keys"],
+        "features": ["invite", "device_keys", "blobs"],
     }))
 }
 
@@ -450,6 +459,18 @@ pub fn build_router(state: AppState) -> Router {
         .route("/debug/vault-stats", get(vault_stats_handler))
         .route("/vault/peers", get(vault_peers_handler))
         .route("/vault/peers/{peer_id}", delete(retire_peer_handler))
+        .route("/vault/blobs/uploads", post(blobs::create_upload))
+        .route(
+            "/vault/blobs/uploads/{upload_id}",
+            put(blobs::put_upload)
+                .get(blobs::get_upload)
+                .layer(DefaultBodyLimit::max(blobs::SEGMENT_BODY_GUARD)),
+        )
+        .route("/vault/blobs/{hash}", get(blobs::get_blob))
+        .route(
+            "/vault/blob-paths",
+            post(blobs::post_blob_path).get(blobs::list_blob_paths),
+        )
         .with_state(state)
 }
 

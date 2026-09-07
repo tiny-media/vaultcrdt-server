@@ -43,6 +43,7 @@ uuid            = { version = "1", features = ["v4"] }
 argon2          = "0.6.0"
 sha2            = "0.10"
 password-hash   = { version = "0.6.1", features = ["phc"] }
+blake3          = "1.8"
 
 [dev-dependencies]
 tower             = "0.5"

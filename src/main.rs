@@ -6,6 +6,7 @@ use vaultcrdt_server::{
 
 const DEFAULT_TOMBSTONE_RETENTION_DAYS: i64 = 365;
 const DEFAULT_PEER_RETENTION_DAYS: i64 = 365;
+const DEFAULT_VAULT_QUOTA_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
 async fn run_server() -> anyhow::Result<()> {
     let bind = std::env::var("VAULTCRDT_BIND").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
@@ -61,6 +62,16 @@ async fn run_server() -> anyhow::Result<()> {
     });
 
     let (broadcast_tx, _) = broadcast::channel::<BroadcastEvent>(256);
+    let blob_dir = std::env::var("VAULTCRDT_BLOB_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("/var/lib/vaultcrdt/blobs"));
+    std::fs::create_dir_all(&blob_dir)?;
+    std::fs::create_dir_all(blob_dir.join("tmp"))?;
+    // 0 = unlimited. Unset keeps the 5 GiB default from the attachment-lane design.
+    let default_quota_bytes = std::env::var("VAULTCRDT_DEFAULT_VAULT_QUOTA")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_VAULT_QUOTA_BYTES);
     let state = AppState {
         db: database,
         jwt_secret,
@@ -75,6 +86,8 @@ async fn run_server() -> anyhow::Result<()> {
         server_epoch: uuid::Uuid::new_v4().to_string(),
         connections: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         doc_locks: DocLocks::default(),
+        blob_dir,
+        default_quota_bytes,
     };
 
     let router = build_router(state);
@@ -114,9 +127,13 @@ async fn run_cli(args: Vec<String>) -> i32 {
             return 1;
         }
     };
+    let default_quota_bytes = std::env::var("VAULTCRDT_DEFAULT_VAULT_QUOTA")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_VAULT_QUOTA_BYTES);
     let mut out = std::io::stdout();
     let mut err = std::io::stderr();
-    cli::run(&database, &args, &mut out, &mut err).await
+    cli::run(&database, default_quota_bytes, &args, &mut out, &mut err).await
 }
 
 #[tokio::main]

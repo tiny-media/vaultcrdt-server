@@ -28,6 +28,8 @@ pub mod msg {
         Auth {
             token: String,
             protocol_version: u32,
+            #[serde(default)]
+            features: Vec<String>,
         },
         Ping,
         RequestDocList,
@@ -99,6 +101,10 @@ pub mod msg {
         CreateConflict {
             doc_uuid: String,
         },
+        BlobPathChanged {
+            path_key: String,
+            seq: i64,
+        },
     }
 }
 
@@ -154,6 +160,7 @@ async fn handle_socket(
     let Ok(msg::ClientMsg::Auth {
         token,
         protocol_version,
+        features,
     }) = rmp_serde::from_slice(&data)
     else {
         close_with(socket, "auth_required").await;
@@ -191,6 +198,7 @@ async fn handle_socket(
     } else {
         format!("conn_id={conn_id}, device={device_name}")
     };
+    let has_blob_feature = features.iter().any(|f| f == "blobs");
     info!("WS connected ({device_label}, vault={vault_id}, query_vault_id={query_vault_id:?})");
 
     // Register connection
@@ -336,7 +344,21 @@ async fn handle_socket(
                         break;
                     }
                 }
-                Ok(_) => {} // skip own messages / other vaults
+                Ok(BroadcastEvent::BlobPathChanged {
+                    vault_id: evt_vault,
+                    path_key,
+                    seq,
+                }) if evt_vault == vault_id && has_blob_feature => {
+                    // Originates from HTTP handlers, so there is no sender-conn to filter.
+                    let msg = msg::ServerMsg::BlobPathChanged { path_key, seq };
+                    let Ok(bytes) = rmp_serde::to_vec_named(&msg) else {
+                        break;
+                    };
+                    if write_tx_bcast.send(bytes).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(_) => {} // skip own messages / other vaults / clients without blobs
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                     warn!("conn {conn_id} lagged {n} msgs — disconnecting");
                     break;

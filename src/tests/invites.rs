@@ -73,7 +73,7 @@ async fn invite_errors_and_features() {
     let state = test_state(test_db().await);
     let (status, body) = call(&state, "GET", "/health", json!(null), None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["features"], json!(["invite", "device_keys"]));
+    assert_eq!(body["features"], json!(["invite", "device_keys", "blobs"]));
     assert_eq!(
         call(&state, "POST", "/invite", json!({"peer_id":"x"}), None)
             .await

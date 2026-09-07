@@ -14,7 +14,7 @@ use tower::ServiceExt;
 async fn run(db: &Db, args: &[&str]) -> (i32, String, String) {
     let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
     let (mut out, mut err) = (Vec::new(), Vec::new());
-    let code = cli::run(db, &args, &mut out, &mut err).await;
+    let code = cli::run(db, 5 * 1024 * 1024 * 1024, &args, &mut out, &mut err).await;
     (
         code,
         String::from_utf8(out).unwrap(),

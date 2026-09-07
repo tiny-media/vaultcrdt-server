@@ -10,6 +10,9 @@ use crate::{AppState, BroadcastEvent, DocLocks, build_router, db, ws::msg};
 async fn spawn_server() -> (String, AppState) {
     let db = db::open_db(":memory:").await.expect("db");
     let (broadcast_tx, _) = tokio::sync::broadcast::channel::<BroadcastEvent>(256);
+    let blob_dir =
+        std::env::temp_dir().join(format!("vaultcrdt-ws-blobs-{}", uuid::Uuid::new_v4()));
+    let _ = std::fs::create_dir_all(blob_dir.join("tmp"));
     let state = AppState {
         db,
         jwt_secret: "test-secret".to_string(),
@@ -20,6 +23,8 @@ async fn spawn_server() -> (String, AppState) {
         server_epoch: "test".to_string(),
         connections: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         doc_locks: DocLocks::default(),
+        blob_dir,
+        default_quota_bytes: 5 * 1024 * 1024 * 1024,
     };
 
     let router = build_router(state.clone());
@@ -59,6 +64,7 @@ async fn ws_connect(
         &msg::ClientMsg::Auth {
             token: token.into(),
             protocol_version: crate::ws::PROTOCOL_VERSION,
+            features: Vec::new(),
         },
     )
     .await;
@@ -167,6 +173,7 @@ async fn test_ws_auth_happy_path() {
         &msg::ClientMsg::Auth {
             token: get_token(&state.jwt_secret, "v1"),
             protocol_version: 1,
+            features: Vec::new(),
         },
     )
     .await;
@@ -201,6 +208,7 @@ async fn test_ws_protocol_version_mismatch() {
         &msg::ClientMsg::Auth {
             token: get_token(&state.jwt_secret, "v1"),
             protocol_version: 99,
+            features: Vec::new(),
         },
     )
     .await;
@@ -275,6 +283,7 @@ async fn test_ws_post_auth_auth_is_bad_frame_without_close() {
         &msg::ClientMsg::Auth {
             token,
             protocol_version: 1,
+            features: Vec::new(),
         },
     )
     .await;
@@ -798,6 +807,7 @@ async fn test_ws_invalid_token_rejected() {
         &msg::ClientMsg::Auth {
             token: "invalid-jwt".into(),
             protocol_version: 1,
+            features: Vec::new(),
         },
     )
     .await;
@@ -983,4 +993,92 @@ async fn test_ws_full_lifecycle() {
         }
         other => panic!("step 6: {other:?}"),
     }
+}
+
+async fn recv_no_msg(
+    stream: &mut futures_util::stream::SplitStream<TestSocket>,
+    dur: std::time::Duration,
+) {
+    match tokio::time::timeout(dur, stream.next()).await {
+        Err(_) => {}
+        Ok(Some(Ok(Message::Binary(data)))) => {
+            let decoded: msg::ServerMsg = rmp_serde::from_slice(&data).expect("decode");
+            panic!("unexpected WS message: {decoded:?}");
+        }
+        Ok(other) => panic!("unexpected WS event: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_ws_blob_path_changed_only_with_blobs_feature() {
+    use tower::ServiceExt;
+    let (addr, state) = spawn_server().await;
+    db::create_vault(&state.db, "v1", "key1").await.unwrap();
+    let token = get_token(&state.jwt_secret, "v1");
+
+    let (sink_plain, mut stream_plain) = ws_connect(&addr, &token).await;
+    let (mut sink_blobs, mut stream_blobs) = ws_connect_raw(&addr).await;
+    send_msg(
+        &mut sink_blobs,
+        &msg::ClientMsg::Auth {
+            token: token.clone(),
+            protocol_version: crate::ws::PROTOCOL_VERSION,
+            features: vec!["blobs".into()],
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_msg(&mut stream_blobs).await,
+        msg::ServerMsg::AuthOk {
+            protocol_version: 1
+        }
+    ));
+
+    let hash = {
+        let bytes = b"ws-wake";
+        blake3::hash(bytes).to_hex().to_string()
+    };
+    state
+        .db
+        .lock()
+        .await
+        .execute(
+            "INSERT INTO blobs (vault_id, hash, size) VALUES (?, ?, ?)",
+            rusqlite::params!["v1", &hash, 7],
+        )
+        .unwrap();
+
+    let app = build_router(state.clone());
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/vault/blob-paths")
+        .header("Authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            serde_json::json!({
+                "path_key": "pics/wake.png",
+                "display_path": "pics/wake.png",
+                "key_version": 1,
+                "generation": 1,
+                "state": "live",
+                "content_hash": hash,
+                "size": 7,
+                "peer_id": "p",
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+    match recv_msg(&mut stream_blobs).await {
+        msg::ServerMsg::BlobPathChanged { path_key, seq } => {
+            assert_eq!(path_key, "pics/wake.png");
+            assert!(seq > 0);
+        }
+        other => panic!("expected BlobPathChanged, got {other:?}"),
+    }
+    recv_no_msg(&mut stream_plain, std::time::Duration::from_millis(200)).await;
+    drop(sink_plain);
+    drop(sink_blobs);
 }

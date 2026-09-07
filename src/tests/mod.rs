@@ -1,3 +1,4 @@
+mod blobs;
 mod cli;
 mod invites;
 mod ws_integration;
@@ -39,6 +40,8 @@ fn test_state(db: Db) -> AppState {
         server_epoch: "test-epoch".to_string(),
         connections: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         doc_locks: DocLocks::default(),
+        blob_dir: std::env::temp_dir().join("vaultcrdt-test-blobs"),
+        default_quota_bytes: 5 * 1024 * 1024 * 1024,
     }
 }
 
@@ -522,12 +525,13 @@ async fn test_open_db_adopts_existing_sqlx_migration_state() {
             include_str!("../../migrations/001_init.sql"),
             include_str!("../../migrations/002_peers.sql"),
             include_str!("../../migrations/003_invites_device_keys.sql"),
+            include_str!("../../migrations/004_blob_lane.sql"),
         ] {
             conn.execute_batch(sql).unwrap();
         }
         conn.execute_batch(
             "CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY, description TEXT NOT NULL);
-             INSERT INTO _sqlx_migrations VALUES (1, 'init'), (2, 'peers'), (3, 'invites');
+             INSERT INTO _sqlx_migrations VALUES (1, 'init'), (2, 'peers'), (3, 'invites'), (4, 'blob_lane');
              INSERT INTO vaults (vault_id, api_key) VALUES ('legacy-vault', 'k');",
         )
         .unwrap();
@@ -539,7 +543,7 @@ async fn test_open_db_adopts_existing_sqlx_migration_state() {
     }
 
     let db = db::open_db(path.to_str().unwrap()).await.unwrap();
-    assert_eq!(scalar::<i64>(&db, "PRAGMA user_version").await, 3);
+    assert_eq!(scalar::<i64>(&db, "PRAGMA user_version").await, 4);
     assert_eq!(
         scalar::<i64>(
             &db,

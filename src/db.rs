@@ -28,13 +28,14 @@ impl Db {
 }
 
 /// Migrations are compiled in; the `migrations/` directory stays the source of
-/// truth. note: three `include_str!` lines beat pulling in `include_dir`
+/// truth. note: four `include_str!` lines beat pulling in `include_dir`
 /// via the `from-directory` feature; switch when migrations get numerous.
 fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(include_str!("../migrations/001_init.sql")),
         M::up(include_str!("../migrations/002_peers.sql")),
         M::up(include_str!("../migrations/003_invites_device_keys.sql")),
+        M::up(include_str!("../migrations/004_blob_lane.sql")),
     ])
 }
 
@@ -147,14 +148,44 @@ pub async fn create_vault(db: &Db, vault_id: &str, api_key: &str) -> Result<bool
     Ok(rows == 1)
 }
 
-/// (vault_id, created_at) for the operator CLI listing.
-pub async fn list_vaults(db: &Db) -> Result<Vec<(String, String)>, ServerError> {
+/// (vault_id, created_at, quota_bytes) for the operator CLI listing.
+/// `quota_bytes` is None when the vault uses the env default.
+pub async fn list_vaults(db: &Db) -> Result<Vec<(String, String, Option<i64>)>, ServerError> {
     let conn = db.lock().await;
-    let mut stmt = conn.prepare("SELECT vault_id, created_at FROM vaults ORDER BY vault_id")?;
+    let mut stmt =
+        conn.prepare("SELECT vault_id, created_at, quota_bytes FROM vaults ORDER BY vault_id")?;
     let rows = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+/// Set per-vault quota. `None` restores the env default; `Some(0)` is unlimited.
+/// Returns false when the vault does not exist.
+pub async fn set_vault_quota(
+    db: &Db,
+    vault_id: &str,
+    quota_bytes: Option<i64>,
+) -> Result<bool, ServerError> {
+    let conn = db.lock().await;
+    let rows = conn.execute(
+        "UPDATE vaults SET quota_bytes = ? WHERE vault_id = ?",
+        params![quota_bytes, vault_id],
+    )?;
+    Ok(rows == 1)
+}
+
+/// Stored quota for a vault: outer None = unknown vault, inner None = env default.
+pub async fn get_vault_quota(db: &Db, vault_id: &str) -> Result<Option<Option<i64>>, ServerError> {
+    let conn = db.lock().await;
+    let row = conn
+        .query_row(
+            "SELECT quota_bytes FROM vaults WHERE vault_id = ?",
+            params![vault_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(row)
 }
 
 pub async fn vault_exists(db: &Db, vault_id: &str) -> Result<bool, ServerError> {

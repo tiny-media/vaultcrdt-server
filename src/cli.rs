@@ -8,6 +8,7 @@ pub const USAGE: &str = "\
 usage: vaultcrdt-server                      run the server
        vaultcrdt-server vault create NAME [--server-url URL] [--json]
        vaultcrdt-server vault list [--json]
+       vaultcrdt-server vault quota NAME BYTES
        vaultcrdt-server invite mint VAULT [--server-url URL] [--json]
 ";
 
@@ -115,7 +116,13 @@ fn kv(out: &mut dyn Write, width: usize, key: &str, value: &str) {
 }
 
 /// `args` excludes the program name: args[0] is the command.
-pub async fn run(db: &Db, args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+pub async fn run(
+    db: &Db,
+    default_quota_bytes: u64,
+    args: &[String],
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> i32 {
     match args.first().map(String::as_str) {
         Some("help" | "--help" | "-h") => {
             let _ = write!(out, "{USAGE}");
@@ -140,7 +147,19 @@ pub async fn run(db: &Db, args: &[String], out: &mut dyn Write, err: &mut dyn Wr
             )
             .await
         }
-        ("vault", Some("list"), 1) => vault_list(db, p.json, out, err).await,
+        ("vault", Some("list"), 1) => vault_list(db, default_quota_bytes, p.json, out, err).await,
+        ("vault", Some("quota"), 3) => {
+            vault_quota(
+                db,
+                default_quota_bytes,
+                &p.positionals[1],
+                &p.positionals[2],
+                p.json,
+                out,
+                err,
+            )
+            .await
+        }
         ("invite", Some("mint"), 2) => {
             invite_mint(
                 db,
@@ -226,7 +245,13 @@ async fn vault_create(
     0
 }
 
-async fn vault_list(db: &Db, json: bool, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+async fn vault_list(
+    db: &Db,
+    default_quota_bytes: u64,
+    json: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> i32 {
     let vaults = match db::list_vaults(db).await {
         Ok(v) => v,
         Err(e) => return runtime_error(err, e),
@@ -234,15 +259,101 @@ async fn vault_list(db: &Db, json: bool, out: &mut dyn Write, err: &mut dyn Writ
     if json {
         let rows: Vec<_> = vaults
             .iter()
-            .map(|(id, created)| serde_json::json!({"vault_id": id, "created_at": created}))
+            .map(|(id, created, quota)| {
+                serde_json::json!({
+                    "vault_id": id,
+                    "created_at": created,
+                    "quota_bytes": quota,
+                    "effective_quota_bytes": effective_quota(*quota, default_quota_bytes),
+                })
+            })
             .collect();
         let _ = writeln!(out, "{}", serde_json::to_string(&rows).unwrap());
         return 0;
     }
-    let width = vaults.iter().map(|(id, _)| id.len()).max().unwrap_or(0);
-    for (id, created) in &vaults {
-        let _ = writeln!(out, "{id:<width$}  {created}");
+    let width = vaults.iter().map(|(id, _, _)| id.len()).max().unwrap_or(0);
+    for (id, created, quota) in &vaults {
+        let stored = match quota {
+            None => "default".to_string(),
+            Some(n) => n.to_string(),
+        };
+        let effective = effective_quota(*quota, default_quota_bytes);
+        let _ = writeln!(
+            out,
+            "{id:<width$}  {created}  quota={stored}  effective={effective}"
+        );
     }
+    0
+}
+
+fn effective_quota(quota_bytes: Option<i64>, default_quota_bytes: u64) -> u64 {
+    match quota_bytes {
+        Some(0) => 0,
+        Some(n) if n > 0 => n as u64,
+        _ => default_quota_bytes,
+    }
+}
+
+async fn vault_quota(
+    db: &Db,
+    default_quota_bytes: u64,
+    name: &str,
+    bytes: &str,
+    json: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> i32 {
+    if !valid_vault_id(name) {
+        return usage(err);
+    }
+    let quota_bytes = if bytes == "default" {
+        None
+    } else {
+        match bytes.parse::<u64>() {
+            Ok(n) if n <= i64::MAX as u64 => Some(n as i64),
+            _ => return usage(err),
+        }
+    };
+    match db::set_vault_quota(db, name, quota_bytes).await {
+        Ok(true) => {}
+        Ok(false) => {
+            let _ = writeln!(err, "vault not found: {name}");
+            return 3;
+        }
+        Err(e) => return runtime_error(err, e),
+    }
+    let stored = match db::get_vault_quota(db, name).await {
+        Ok(Some(q)) => q,
+        Ok(None) => {
+            let _ = writeln!(err, "vault not found: {name}");
+            return 3;
+        }
+        Err(e) => return runtime_error(err, e),
+    };
+    let effective = effective_quota(stored, default_quota_bytes);
+    if json {
+        let _ = writeln!(
+            out,
+            "{}",
+            serde_json::json!({
+                "vault_id": name,
+                "quota_bytes": stored,
+                "effective_quota_bytes": effective,
+            })
+        );
+        return 0;
+    }
+    kv(out, 9, "vault", name);
+    kv(
+        out,
+        9,
+        "quota",
+        &match stored {
+            None => "default".to_string(),
+            Some(n) => n.to_string(),
+        },
+    );
+    kv(out, 9, "effective", &effective.to_string());
     0
 }
 
