@@ -543,7 +543,7 @@ async fn test_open_db_adopts_existing_sqlx_migration_state() {
     }
 
     let db = db::open_db(path.to_str().unwrap()).await.unwrap();
-    assert_eq!(scalar::<i64>(&db, "PRAGMA user_version").await, 4);
+    assert_eq!(scalar::<i64>(&db, "PRAGMA user_version").await, 5);
     assert_eq!(
         scalar::<i64>(
             &db,
@@ -1778,4 +1778,192 @@ fn test_oversized_frame_error_message_shape() {
         }
         other => panic!("expected Error, got {other:?}"),
     }
+}
+
+// ── Migration 005: tombstone content_hash ───────────────────────────────────
+
+#[tokio::test]
+async fn test_migration_005_adds_tombstone_content_hash_and_preserves_nulls() {
+    let path = std::env::temp_dir().join(format!("vault-m005-{}.db", uuid::Uuid::new_v4()));
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        for sql in [
+            include_str!("../../migrations/001_init.sql"),
+            include_str!("../../migrations/002_peers.sql"),
+            include_str!("../../migrations/003_invites_device_keys.sql"),
+            include_str!("../../migrations/004_blob_lane.sql"),
+        ] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 4).unwrap();
+        conn.execute(
+            "INSERT INTO tombstones (vault_id, doc_uuid, deleted_by) VALUES ('v', 'old.md', 'peer')",
+            [],
+        )
+        .unwrap();
+        let names: Vec<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(tombstones)").unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert!(
+            !names.iter().any(|n| n == "content_hash"),
+            "004 schema must not already have content_hash"
+        );
+    }
+
+    let db = db::open_db(path.to_str().unwrap()).await.unwrap();
+    assert_eq!(scalar::<i64>(&db, "PRAGMA user_version").await, 5);
+    let names: Vec<String> = {
+        let conn = db.lock().await;
+        let mut stmt = conn.prepare("PRAGMA table_info(tombstones)").unwrap();
+        stmt.query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    assert!(names.iter().any(|n| n == "content_hash"));
+    let hash: Option<String> = scalar(
+        &db,
+        "SELECT content_hash FROM tombstones WHERE doc_uuid = 'old.md'",
+    )
+    .await;
+    assert_eq!(hash, None);
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+fn loro_snapshot_with_content(text: &str) -> (Vec<u8>, Vec<u8>) {
+    use crate::vv_serde;
+    use loro::{ExportMode, LoroDoc};
+    let doc = LoroDoc::new();
+    doc.get_text("content").insert(0, text).unwrap();
+    let snapshot = doc.export(ExportMode::Snapshot).unwrap();
+    let vv_blob = vv_serde::vv_to_db_bytes(&doc.oplog_vv());
+    (snapshot, vv_blob)
+}
+
+#[tokio::test]
+async fn test_delete_captures_fnv_content_hash() {
+    let db = test_db().await;
+    let (snapshot, vv) = loro_snapshot_with_content("vaultcrdt fnv golden");
+    db::store_snapshot_with_vv(&db, "v", "note.md", &snapshot, &vv)
+        .await
+        .unwrap();
+
+    db::delete_doc_and_tombstone(&db, "v", "note.md", "peer-x")
+        .await
+        .unwrap();
+
+    let hashes = db::list_tombstones_with_hash(&db, "v").await.unwrap();
+    assert_eq!(hashes.len(), 1);
+    assert_eq!(hashes[0].doc_uuid, "note.md");
+    assert_eq!(hashes[0].content_hash.as_deref(), Some("a6a9b25f2a464e61"));
+}
+
+#[tokio::test]
+async fn test_delete_without_document_row_stores_null_hash() {
+    let db = test_db().await;
+    db::delete_doc_and_tombstone(&db, "v", "ghost.md", "peer-x")
+        .await
+        .unwrap();
+
+    let hashes = db::list_tombstones_with_hash(&db, "v").await.unwrap();
+    assert_eq!(hashes.len(), 1);
+    assert_eq!(hashes[0].doc_uuid, "ghost.md");
+    assert_eq!(hashes[0].content_hash, None);
+    assert!(db::is_tombstoned(&db, "v", "ghost.md").await.unwrap());
+}
+
+#[tokio::test]
+async fn test_doc_list_tombstone_hashes_and_null_roundtrip() {
+    use crate::handlers::process_message;
+    use crate::ws::msg;
+
+    let db = test_db().await;
+    db::create_vault(&db, "v", "k").await.unwrap();
+    let doc_locks = DocLocks::default();
+
+    let (snapshot, vv) = loro_snapshot_with_content("vaultcrdt fnv golden");
+    db::store_snapshot_with_vv(&db, "v", "a.md", &snapshot, &vv)
+        .await
+        .unwrap();
+    db::delete_doc_and_tombstone(&db, "v", "a.md", "peer")
+        .await
+        .unwrap();
+    // Pre-migration-style row: tombstone insert without a captured hash.
+    db::tombstone(&db, "v", "legacy.md", "peer").await.unwrap();
+
+    let req = rmp_serde::to_vec_named(&msg::ClientMsg::RequestDocList).unwrap();
+    let (resp, _) = process_message(&req, &db, "v", 1, &doc_locks).await;
+    match resp {
+        msg::ServerMsg::DocList {
+            tombstones,
+            tombstone_hashes,
+            ..
+        } => {
+            assert_eq!(tombstones, vec!["a.md", "legacy.md"]);
+            assert_eq!(tombstone_hashes.len(), 2);
+            assert_eq!(tombstone_hashes[0].doc_uuid, "a.md");
+            assert_eq!(
+                tombstone_hashes[0].content_hash.as_deref(),
+                Some("a6a9b25f2a464e61")
+            );
+            assert_eq!(tombstone_hashes[1].doc_uuid, "legacy.md");
+            assert_eq!(tombstone_hashes[1].content_hash, None);
+        }
+        other => panic!("expected DocList, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_delete_recreate_delete_stores_second_version_hash() {
+    use crate::handlers::process_message;
+    use crate::ws::msg;
+    use loro::{ExportMode, LoroDoc};
+
+    let db = test_db().await;
+    db::create_vault(&db, "v", "k").await.unwrap();
+    let doc_locks = DocLocks::default();
+
+    let (snap1, vv1) = loro_snapshot_with_content("vaultcrdt fnv golden");
+    db::store_snapshot_with_vv(&db, "v", "same.md", &snap1, &vv1)
+        .await
+        .unwrap();
+    db::delete_doc_and_tombstone(&db, "v", "same.md", "peer-1")
+        .await
+        .unwrap();
+    let first = db::list_tombstones_with_hash(&db, "v").await.unwrap();
+    assert_eq!(first[0].content_hash.as_deref(), Some("a6a9b25f2a464e61"));
+
+    let doc2 = LoroDoc::new();
+    doc2.get_text("content")
+        .insert(0, "äöü€ deleter täst")
+        .unwrap();
+    let snap2 = doc2.export(ExportMode::Snapshot).unwrap();
+    let create = rmp_serde::to_vec_named(&msg::ClientMsg::DocCreate {
+        doc_uuid: "same.md".into(),
+        snapshot: snap2,
+        peer_id: "peer-2".into(),
+        replace_tombstone: true,
+    })
+    .unwrap();
+    let (resp, _) = process_message(&create, &db, "v", 1, &doc_locks).await;
+    assert!(matches!(resp, msg::ServerMsg::Ack));
+    assert!(!db::is_tombstoned(&db, "v", "same.md").await.unwrap());
+
+    let delete = rmp_serde::to_vec_named(&msg::ClientMsg::DocDelete {
+        doc_uuid: "same.md".into(),
+        peer_id: "peer-2".into(),
+    })
+    .unwrap();
+    let (resp, _) = process_message(&delete, &db, "v", 2, &doc_locks).await;
+    assert!(matches!(resp, msg::ServerMsg::Ack));
+
+    let second = db::list_tombstones_with_hash(&db, "v").await.unwrap();
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].doc_uuid, "same.md");
+    assert_eq!(second[0].content_hash.as_deref(), Some("708d67b2a1da6d2f"));
 }

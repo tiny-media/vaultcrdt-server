@@ -73,6 +73,7 @@ pub mod msg {
         DocList {
             docs: Vec<db::DocEntry>,
             tombstones: Vec<String>,
+            tombstone_hashes: Vec<db::TombstoneHash>,
         },
         SyncDelta {
             doc_uuid: String,

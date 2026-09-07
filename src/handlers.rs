@@ -53,12 +53,20 @@ async fn process_inner(
         msg::ClientMsg::RequestDocList => {
             let docs = db::list_docs_with_vv(db, vault_id).await?;
             let tombstones = db::list_tombstones(db, vault_id).await?;
+            let tombstone_hashes = db::list_tombstones_with_hash(db, vault_id).await?;
             info!(
                 "request_doc_list: vault={vault_id}, docs={}, tombstones={}",
                 docs.len(),
                 tombstones.len()
             );
-            Ok((msg::ServerMsg::DocList { docs, tombstones }, None))
+            Ok((
+                msg::ServerMsg::DocList {
+                    docs,
+                    tombstones,
+                    tombstone_hashes,
+                },
+                None,
+            ))
         }
 
         msg::ClientMsg::SyncStart {

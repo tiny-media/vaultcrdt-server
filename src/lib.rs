@@ -3,6 +3,7 @@ pub mod blobs;
 pub mod cli;
 pub mod db;
 pub mod errors;
+pub mod fnv;
 pub mod handlers;
 pub mod invites;
 pub mod vv_serde;

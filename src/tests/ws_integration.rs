@@ -320,7 +320,9 @@ async fn test_ws_request_doc_list_empty() {
     send_msg(&mut sink, &msg::ClientMsg::RequestDocList).await;
 
     match recv_msg(&mut stream).await {
-        msg::ServerMsg::DocList { docs, tombstones } => {
+        msg::ServerMsg::DocList {
+            docs, tombstones, ..
+        } => {
             assert!(docs.is_empty());
             assert!(tombstones.is_empty());
         }
@@ -359,7 +361,9 @@ async fn test_ws_doc_create_and_list() {
     // List docs
     send_msg(&mut sink, &msg::ClientMsg::RequestDocList).await;
     match recv_msg(&mut stream).await {
-        msg::ServerMsg::DocList { docs, tombstones } => {
+        msg::ServerMsg::DocList {
+            docs, tombstones, ..
+        } => {
             assert_eq!(docs.len(), 1);
             assert_eq!(docs[0].doc_uuid, "note.md");
             assert!(tombstones.is_empty());
@@ -915,7 +919,9 @@ async fn test_ws_full_lifecycle() {
     // 1. Empty doc list
     send_msg(&mut sink, &msg::ClientMsg::RequestDocList).await;
     match recv_msg(&mut stream).await {
-        msg::ServerMsg::DocList { docs, tombstones } => {
+        msg::ServerMsg::DocList {
+            docs, tombstones, ..
+        } => {
             assert!(docs.is_empty());
             assert!(tombstones.is_empty());
         }
@@ -987,7 +993,9 @@ async fn test_ws_full_lifecycle() {
     // 6. Verify tombstone in doc list
     send_msg(&mut sink, &msg::ClientMsg::RequestDocList).await;
     match recv_msg(&mut stream).await {
-        msg::ServerMsg::DocList { docs, tombstones } => {
+        msg::ServerMsg::DocList {
+            docs, tombstones, ..
+        } => {
             assert!(docs.is_empty());
             assert_eq!(tombstones, vec!["test.md"]);
         }

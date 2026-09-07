@@ -1,3 +1,4 @@
+use loro::LoroDoc;
 use rusqlite::{Connection, OptionalExtension, params};
 use rusqlite_migration::{M, Migrations};
 use serde::{Deserialize, Serialize};
@@ -28,7 +29,7 @@ impl Db {
 }
 
 /// Migrations are compiled in; the `migrations/` directory stays the source of
-/// truth. note: four `include_str!` lines beat pulling in `include_dir`
+/// truth. note: five `include_str!` lines beat pulling in `include_dir`
 /// via the `from-directory` feature; switch when migrations get numerous.
 fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
@@ -36,6 +37,7 @@ fn migrations() -> Migrations<'static> {
         M::up(include_str!("../migrations/002_peers.sql")),
         M::up(include_str!("../migrations/003_invites_device_keys.sql")),
         M::up(include_str!("../migrations/004_blob_lane.sql")),
+        M::up(include_str!("../migrations/005_tombstone_content_hash.sql")),
     ])
 }
 
@@ -105,6 +107,12 @@ pub struct DocEntry {
     pub updated_at: String,
     #[serde(with = "serde_bytes")]
     pub server_vv: Vec<u8>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct TombstoneHash {
+    pub doc_uuid: String,
+    pub content_hash: Option<String>,
 }
 
 // ── Secret hashing (Argon2id) ────────────────────────────────────────────────
@@ -331,6 +339,27 @@ pub async fn list_tombstones(db: &Db, vault_id: &str) -> Result<Vec<String>, Ser
     Ok(rows)
 }
 
+/// Same `ORDER BY doc_uuid` as [`list_tombstones`]. Consumers must look up
+/// by `doc_uuid` (map), not zip — ordering parity is a convenience only.
+pub async fn list_tombstones_with_hash(
+    db: &Db,
+    vault_id: &str,
+) -> Result<Vec<TombstoneHash>, ServerError> {
+    let conn = db.lock().await;
+    let mut stmt = conn.prepare(
+        "SELECT doc_uuid, content_hash FROM tombstones WHERE vault_id = ? ORDER BY doc_uuid",
+    )?;
+    let rows = stmt
+        .query_map(params![vault_id], |r| {
+            Ok(TombstoneHash {
+                doc_uuid: r.get(0)?,
+                content_hash: r.get(1)?,
+            })
+        })?
+        .collect::<Result<Vec<TombstoneHash>, _>>()?;
+    Ok(rows)
+}
+
 pub async fn is_tombstoned(db: &Db, vault_id: &str, doc_uuid: &str) -> Result<bool, ServerError> {
     let conn = db.lock().await;
     let found: Option<i64> = conn
@@ -361,7 +390,20 @@ pub async fn delete_doc(db: &Db, vault_id: &str, doc_uuid: &str) -> Result<(), S
     Ok(())
 }
 
+/// Hash the Loro `content` text of a snapshot. `None` if import fails.
+fn content_hash_from_snapshot_blob(snapshot_blob: &[u8]) -> Option<String> {
+    let doc = LoroDoc::new();
+    doc.import(snapshot_blob).ok()?;
+    Some(crate::fnv::fnv1a_64_hex(
+        &doc.get_text("content").to_string(),
+    ))
+}
+
 /// Atomically delete the document row and insert/update its tombstone.
+///
+/// Captures `content_hash` from the snapshot *before* the row is deleted.
+/// NULL if there is no document row or text extraction fails; the delete
+/// itself still succeeds.
 pub async fn delete_doc_and_tombstone(
     db: &Db,
     vault_id: &str,
@@ -370,16 +412,27 @@ pub async fn delete_doc_and_tombstone(
 ) -> Result<(), ServerError> {
     let mut conn = db.lock().await;
     let tx = conn.transaction()?;
+    let snapshot_blob: Option<Vec<u8>> = tx
+        .query_row(
+            "SELECT snapshot_blob FROM documents WHERE vault_id = ? AND doc_uuid = ?",
+            params![vault_id, doc_uuid],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let content_hash = snapshot_blob
+        .as_deref()
+        .and_then(content_hash_from_snapshot_blob);
     tx.execute(
         "DELETE FROM documents WHERE vault_id = ? AND doc_uuid = ?",
         params![vault_id, doc_uuid],
     )?;
     tx.execute(
-        "INSERT INTO tombstones (vault_id, doc_uuid, deleted_by) VALUES (?, ?, ?) \
+        "INSERT INTO tombstones (vault_id, doc_uuid, deleted_by, content_hash) VALUES (?, ?, ?, ?) \
          ON CONFLICT(vault_id, doc_uuid) DO UPDATE SET \
            deleted_by = excluded.deleted_by, \
-           deleted_at = datetime('now')",
-        params![vault_id, doc_uuid, deleted_by],
+           deleted_at = datetime('now'), \
+           content_hash = excluded.content_hash",
+        params![vault_id, doc_uuid, deleted_by, content_hash],
     )?;
     tx.commit()?;
     Ok(())
