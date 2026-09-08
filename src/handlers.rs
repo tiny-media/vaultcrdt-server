@@ -2,7 +2,29 @@ use crate::db::Db;
 use loro::{ExportMode, LoroDoc};
 use tracing::{debug, info};
 
-use crate::{BroadcastEvent, DocLocks, db, errors::ServerError, vv_serde, ws::msg};
+use crate::{
+    BroadcastEvent, DocLocks, MAX_DOC_UUID_BYTES, MAX_PEER_ID_BYTES, db, errors::ServerError,
+    vv_serde, ws::msg,
+};
+
+/// Reject over-long identifiers before dispatch. The client-facing text of
+/// `BadFrame` is generic, so the specifics are logged server-side here.
+fn check_len(
+    field: &str,
+    value: &str,
+    max: usize,
+    vault_id: &str,
+    conn_id: u64,
+) -> Result<(), ServerError> {
+    if value.len() > max {
+        tracing::warn!(
+            "conn {conn_id}, vault={vault_id}: {field} too long ({} bytes, limit {max})",
+            value.len()
+        );
+        return Err(ServerError::BadFrame(format!("{field} too long")));
+    }
+    Ok(())
+}
 
 // ── Message processing ──────────────────────────────────────────────────────
 
@@ -45,6 +67,24 @@ async fn process_inner(
 ) -> Result<(msg::ServerMsg, Option<BroadcastEvent>), ServerError> {
     let msg: msg::ClientMsg = rmp_serde::from_slice(data)
         .map_err(|e| ServerError::BadFrame(format!("invalid msgpack: {e}")))?;
+
+    // Identifier caps (#5/N19): before dispatch and before any DocLocks work.
+    match &msg {
+        msg::ClientMsg::SyncStart { doc_uuid, .. } => {
+            check_len("doc_uuid", doc_uuid, MAX_DOC_UUID_BYTES, vault_id, conn_id)?;
+        }
+        msg::ClientMsg::SyncPush {
+            doc_uuid, peer_id, ..
+        }
+        | msg::ClientMsg::DocCreate {
+            doc_uuid, peer_id, ..
+        }
+        | msg::ClientMsg::DocDelete { doc_uuid, peer_id } => {
+            check_len("doc_uuid", doc_uuid, MAX_DOC_UUID_BYTES, vault_id, conn_id)?;
+            check_len("peer_id", peer_id, MAX_PEER_ID_BYTES, vault_id, conn_id)?;
+        }
+        _ => {}
+    }
 
     match msg {
         msg::ClientMsg::Auth { .. } => Err(ServerError::BadFrame("unexpected auth frame".into())),

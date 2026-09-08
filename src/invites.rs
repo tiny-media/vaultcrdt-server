@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::net::SocketAddr;
 
-use crate::{AppState, VaultAuth, auth, db, db::Db, errors::ServerError};
+use crate::{AppState, MAX_PEER_ID_BYTES, VaultAuth, auth, db, db::Db, errors::ServerError};
 
 // UUID v4 uses the existing OS-backed randomness source. Exclude the two
 // version/variant bytes; rejection sampling avoids alphabet modulo bias.
@@ -71,6 +71,14 @@ pub async fn create(
 ) -> Result<Response, ServerError> {
     if body.peer_id.is_empty() {
         return Ok(error(StatusCode::BAD_REQUEST, "peer_id must not be empty"));
+    }
+    if body.peer_id.len() > MAX_PEER_ID_BYTES
+        || body
+            .device_name
+            .as_deref()
+            .is_some_and(|d| d.len() > MAX_PEER_ID_BYTES)
+    {
+        return Ok(error(StatusCode::BAD_REQUEST, "identifier too long"));
     }
     let (invite, expires_at) = mint_invite(
         &state.db,
@@ -134,6 +142,9 @@ pub async fn redeem(
     if body.peer_id.is_empty() {
         return Ok(error(StatusCode::BAD_REQUEST, "peer_id must not be empty"));
     }
+    if body.peer_id.len() > MAX_PEER_ID_BYTES || body.device_name.len() > MAX_PEER_ID_BYTES {
+        return Ok(error(StatusCode::BAD_REQUEST, "identifier too long"));
+    }
     // No caller-controlled vault selector or per-vault brute-force counter.
     // Keep used/expired hashes so their exact, authenticated errors remain available.
     let candidates: Vec<(i64, String, String)> = {
@@ -195,10 +206,36 @@ pub struct DeviceRequest {
     device_key: String,
 }
 
+/// True iff the device key row exists and is not revoked.
+///
+/// KNOWN LIMITATION: the unit tests exercise this helper directly and cannot
+/// prove the CALL ORDER in `device_auth` (verify → recheck → sign; three
+/// lines below). The residual race — recheck passes, the retirement commits,
+/// the token is signed — stays open by design until the N1 device-binding
+/// decision lands.
+pub async fn ensure_not_revoked(
+    db: &Db,
+    vault_id: &str,
+    peer_id: &str,
+) -> Result<bool, rusqlite::Error> {
+    let conn = db.lock().await;
+    let found: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM device_keys WHERE vault_id = ? AND peer_id = ? AND revoked_at IS NULL",
+            params![vault_id, peer_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(found.is_some())
+}
+
 pub async fn device_auth(
     State(state): State<AppState>,
     Json(body): Json<DeviceRequest>,
 ) -> Result<Response, ServerError> {
+    if body.peer_id.len() > MAX_PEER_ID_BYTES {
+        return Ok(error(StatusCode::UNAUTHORIZED, "authentication failed"));
+    }
     let hash: Option<String> = {
         let conn = state.db.lock().await;
         conn.query_row(
@@ -209,6 +246,11 @@ pub async fn device_auth(
         .optional()?
     };
     if !hash.is_some_and(|hash| db::verify_secret(&body.device_key, &hash)) {
+        return Ok(error(StatusCode::UNAUTHORIZED, "authentication failed"));
+    }
+    // N2: re-read the row after the (slow) argon2 verify — a revocation that
+    // committed while we were hashing must not still yield a token.
+    if !ensure_not_revoked(&state.db, &body.vault_id, &body.peer_id).await? {
         return Ok(error(StatusCode::UNAUTHORIZED, "authentication failed"));
     }
     Ok(Json(json!({"token": auth::jwt_sign(&body.vault_id, &state.jwt_secret)?})).into_response())

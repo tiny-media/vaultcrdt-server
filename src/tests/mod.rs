@@ -2251,3 +2251,131 @@ async fn test_doc_delete_broadcast_carries_captured_and_coalesce_hash() {
         other => panic!("expected DocList, got {other:?}"),
     }
 }
+
+// ── Identifier length caps (#5 / N19) ───────────────────────────────────────
+
+/// doc_uuid caps: 1024 bytes accepted, 1025 rejected as bad_frame, no writes.
+#[tokio::test]
+async fn test_oversized_doc_uuid_rejected_in_every_variant() {
+    use crate::handlers::process_message;
+    use crate::ws::msg;
+    use loro::{ExportMode, LoroDoc};
+
+    let db = test_db().await;
+    db::create_vault(&db, "v", "k").await.unwrap();
+    let doc_locks = DocLocks::default();
+    let doc = LoroDoc::new();
+    doc.get_text("text").insert(0, "hello").unwrap();
+    let snapshot = doc.export(ExportMode::Snapshot).unwrap();
+
+    let too_long = "a".repeat(1025);
+    let frames = [
+        rmp_serde::to_vec_named(&msg::ClientMsg::SyncStart {
+            doc_uuid: too_long.clone(),
+            client_vv: None,
+        })
+        .unwrap(),
+        rmp_serde::to_vec_named(&msg::ClientMsg::SyncPush {
+            doc_uuid: too_long.clone(),
+            delta: snapshot.clone(),
+            peer_id: "p".into(),
+        })
+        .unwrap(),
+        rmp_serde::to_vec_named(&msg::ClientMsg::DocCreate {
+            doc_uuid: too_long.clone(),
+            snapshot: snapshot.clone(),
+            peer_id: "p".into(),
+            replace_tombstone: false,
+        })
+        .unwrap(),
+        rmp_serde::to_vec_named(&msg::ClientMsg::DocDelete {
+            doc_uuid: too_long.clone(),
+            peer_id: "p".into(),
+        })
+        .unwrap(),
+    ];
+    for frame in frames {
+        let (resp, broadcast) = process_message(&frame, &db, "v", 1, &doc_locks).await;
+        match resp {
+            msg::ServerMsg::Error { code, .. } => assert_eq!(code, "bad_frame"),
+            other => panic!("expected bad_frame error, got {other:?}"),
+        }
+        assert!(broadcast.is_none());
+    }
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT COUNT(*) FROM documents").await,
+        0
+    );
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT COUNT(*) FROM tombstones").await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn test_doc_uuid_and_peer_id_boundaries() {
+    use crate::handlers::process_message;
+    use crate::ws::msg;
+    use loro::{ExportMode, LoroDoc};
+
+    let db = test_db().await;
+    db::create_vault(&db, "v", "k").await.unwrap();
+    let doc_locks = DocLocks::default();
+    let doc = LoroDoc::new();
+    doc.get_text("text").insert(0, "hello").unwrap();
+    let snapshot = doc.export(ExportMode::Snapshot).unwrap();
+
+    // 1024 bytes doc_uuid + 128 bytes peer_id: accepted.
+    let create = rmp_serde::to_vec_named(&msg::ClientMsg::DocCreate {
+        doc_uuid: "a".repeat(1024),
+        snapshot: snapshot.clone(),
+        peer_id: "p".repeat(128),
+        replace_tombstone: false,
+    })
+    .unwrap();
+    let (resp, broadcast) = process_message(&create, &db, "v", 1, &doc_locks).await;
+    assert!(matches!(resp, msg::ServerMsg::Ack), "got {resp:?}");
+    assert!(broadcast.is_some());
+
+    // 129-byte peer_id: rejected.
+    let bad_peer = rmp_serde::to_vec_named(&msg::ClientMsg::DocCreate {
+        doc_uuid: "b.md".into(),
+        snapshot: snapshot.clone(),
+        peer_id: "p".repeat(129),
+        replace_tombstone: false,
+    })
+    .unwrap();
+    let (resp, broadcast) = process_message(&bad_peer, &db, "v", 2, &doc_locks).await;
+    match resp {
+        msg::ServerMsg::Error { code, .. } => assert_eq!(code, "bad_frame"),
+        other => panic!("expected bad_frame error, got {other:?}"),
+    }
+    assert!(broadcast.is_none());
+
+    // Multibyte: 512 × 'ä' = 1024 bytes (accepted), 513 × 'ä' = 1026 (rejected).
+    let ok = rmp_serde::to_vec_named(&msg::ClientMsg::SyncStart {
+        doc_uuid: "ä".repeat(512),
+        client_vv: None,
+    })
+    .unwrap();
+    let (resp, _) = process_message(&ok, &db, "v", 3, &doc_locks).await;
+    assert!(
+        matches!(resp, msg::ServerMsg::DocUnknown { .. }),
+        "got {resp:?}"
+    );
+    let too_long = rmp_serde::to_vec_named(&msg::ClientMsg::SyncStart {
+        doc_uuid: "ä".repeat(513),
+        client_vv: None,
+    })
+    .unwrap();
+    let (resp, _) = process_message(&too_long, &db, "v", 4, &doc_locks).await;
+    match resp {
+        msg::ServerMsg::Error { code, .. } => assert_eq!(code, "bad_frame"),
+        other => panic!("expected bad_frame error, got {other:?}"),
+    }
+
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT COUNT(*) FROM documents").await,
+        1
+    );
+}

@@ -26,7 +26,24 @@ async fn run_server() -> anyhow::Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_PEER_RETENTION_DAYS);
+    // blob_dir must exist before the sweeper runs, so it is created (and swept
+    // once) here, ahead of the hourly task spawn.
+    let blob_dir = std::env::var("VAULTCRDT_BLOB_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("/var/lib/vaultcrdt/blobs"));
+    std::fs::create_dir_all(&blob_dir)?;
+    std::fs::create_dir_all(blob_dir.join("tmp"))?;
+    match vaultcrdt_server::blobs::sweep_expired_uploads(&database, &blob_dir).await {
+        Ok(0) => {}
+        Ok(n) => info!("startup sweep: discarded {n} expired uploads"),
+        Err(e) => warn!("startup upload sweep failed: {e}"),
+    }
+
     let hourly_db = database.clone();
+    // tokio's interval fires its first tick immediately, so at boot the task
+    // sweeps once more right after the startup sweep above. Both sweeps are
+    // idempotent; the duplicate is accepted for simplicity.
+    let hourly_blob_dir = blob_dir.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
         loop {
@@ -40,6 +57,12 @@ async fn run_server() -> anyhow::Result<()> {
                 Ok(0) => {}
                 Ok(n) => info!("expired {n} stale peers (>{peer_days} days)"),
                 Err(e) => warn!("peer expiry failed: {e}"),
+            }
+            match vaultcrdt_server::blobs::sweep_expired_uploads(&hourly_db, &hourly_blob_dir).await
+            {
+                Ok(0) => {}
+                Ok(n) => info!("discarded {n} expired uploads"),
+                Err(e) => warn!("upload sweep failed: {e}"),
             }
         }
     });
@@ -60,11 +83,6 @@ async fn run_server() -> anyhow::Result<()> {
     });
 
     let (broadcast_tx, _) = broadcast::channel::<BroadcastEvent>(256);
-    let blob_dir = std::env::var("VAULTCRDT_BLOB_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("/var/lib/vaultcrdt/blobs"));
-    std::fs::create_dir_all(&blob_dir)?;
-    std::fs::create_dir_all(blob_dir.join("tmp"))?;
     // 0 = unlimited. Unset keeps the 5 GiB default from the attachment-lane design.
     let default_quota_bytes = std::env::var("VAULTCRDT_DEFAULT_VAULT_QUOTA")
         .ok()

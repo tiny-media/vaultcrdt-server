@@ -1138,3 +1138,26 @@ async fn test_ws_blob_path_changed_only_with_blobs_feature() {
     drop(sink_plain);
     drop(sink_blobs);
 }
+
+/// Oversized query identifiers are rejected at the upgrade (HTTP 400), before
+/// any peer persistence happens.
+#[tokio::test]
+async fn test_ws_query_identifier_caps() {
+    let (addr, state) = spawn_server().await;
+    let long = "p".repeat(129);
+    for uri in [
+        format!("ws://{addr}/ws?peer_id={long}&device=t"),
+        format!("ws://{addr}/ws?peer_id=test&device={long}"),
+    ] {
+        let err = connect_async(uri).await.err().expect("upgrade must fail");
+        let text = err.to_string();
+        assert!(text.contains("400"), "expected HTTP 400, got {text}");
+    }
+    let peers: i64 = state
+        .db
+        .lock()
+        .await
+        .query_row("SELECT COUNT(*) FROM peers", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(peers, 0);
+}

@@ -27,6 +27,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 use tracing::info;
 
+// ── Identifier length caps ──────────────────────────────────────────────────
+
+/// Maximum UTF-8 byte length of a client-supplied `doc_uuid`.
+pub const MAX_DOC_UUID_BYTES: usize = 1024;
+
+/// Maximum UTF-8 byte length of a client-supplied `peer_id` / device name.
+pub const MAX_PEER_ID_BYTES: usize = 128;
+
 // ── Per-document locks ──────────────────────────────────────────────────────
 
 /// Serialize read-modify-write operations per document (prevents TOCTOU races).

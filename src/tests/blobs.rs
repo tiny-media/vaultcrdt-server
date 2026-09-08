@@ -1012,3 +1012,48 @@ async fn test_svg_r2_tombstone_missing_blob_not_rejected() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["accepted"], true);
 }
+
+#[tokio::test]
+async fn sweeper_discards_expired_uploads_across_vaults() {
+    let db = test_db().await;
+    db::create_vault(&db, "v1", "k").await.unwrap();
+    db::create_vault(&db, "v2", "k").await.unwrap();
+    let dir = std::env::temp_dir().join(format!("vaultcrdt-sweep-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(dir.join("tmp")).unwrap();
+    let _guard = BlobDir(dir.clone());
+
+    for (vault, upload) in [("v1", "old-1"), ("v2", "old-2"), ("v1", "fresh")] {
+        std::fs::write(dir.join("tmp").join(upload), b"x").unwrap();
+        db.lock()
+            .await
+            .execute(
+                "INSERT INTO blob_uploads (vault_id, upload_id, hash_claimed, size_claimed) VALUES (?, ?, 'h', 1)",
+                rusqlite::params![vault, upload],
+            )
+            .unwrap();
+    }
+    exec(
+        &db,
+        "UPDATE blob_uploads SET created_at = datetime('now', '-25 hours') WHERE upload_id LIKE 'old-%'",
+    )
+    .await;
+
+    let attempted = crate::blobs::sweep_expired_uploads(&db, &dir)
+        .await
+        .unwrap();
+    assert_eq!(attempted, 2);
+    let remaining: Vec<String> = {
+        let conn = db.lock().await;
+        let mut stmt = conn.prepare("SELECT upload_id FROM blob_uploads").unwrap();
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        rows
+    };
+    assert_eq!(remaining, vec!["fresh".to_string()]);
+    assert!(!dir.join("tmp").join("old-1").exists());
+    assert!(!dir.join("tmp").join("old-2").exists());
+    assert!(dir.join("tmp").join("fresh").exists());
+}

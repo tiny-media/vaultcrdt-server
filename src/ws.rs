@@ -3,7 +3,8 @@ use axum::{
         Query, State, WebSocketUpgrade,
         ws::{CloseFrame, Message, WebSocket, close_code},
     },
-    response::Response,
+    http::StatusCode,
+    response::{IntoResponse, Response},
 };
 use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
@@ -124,6 +125,19 @@ pub async fn ws_handler(
 ) -> Response {
     let device_name = params.get("device").cloned().unwrap_or_default();
     let peer_id = params.get("peer_id").cloned().unwrap_or_default();
+
+    // Identifier caps (#5/N19): reject before upgrade, logging or persistence.
+    // Empty peer ids stay valid (they merely skip peer persistence below).
+    for (field, value) in [("peer_id", &peer_id), ("device", &device_name)] {
+        if value.len() > crate::MAX_PEER_ID_BYTES {
+            warn!(
+                "WS upgrade rejected: {field} too long ({} bytes, limit {})",
+                value.len(),
+                crate::MAX_PEER_ID_BYTES
+            );
+            return (StatusCode::BAD_REQUEST, "identifier too long").into_response();
+        }
+    }
 
     let query_vault_id = params.get("vault_id").cloned();
     ws.on_upgrade(move |socket| handle_socket(socket, state, device_name, peer_id, query_vault_id))

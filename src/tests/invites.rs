@@ -226,3 +226,56 @@ async fn onboarding_shares_auth_rate_limit() {
         );
     }
 }
+
+#[tokio::test]
+async fn oversized_identifiers_rejected_on_create_and_redeem() {
+    let state = test_state(test_db().await);
+    let jwt = auth::jwt_sign("vault-a", &state.jwt_secret).unwrap();
+    let long = "p".repeat(129);
+
+    for body in [
+        json!({"peer_id": long, "device_name": "Phone"}),
+        json!({"peer_id": "inviter", "device_name": long}),
+    ] {
+        let (status, _) = call(&state, "POST", "/invite", body, Some(&jwt)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    let token = invite(&state, "vault-a").await;
+    for body in [
+        json!({"invite": token, "peer_id": long, "device_name": "Phone"}),
+        json!({"invite": token, "peer_id": "joining", "device_name": long}),
+    ] {
+        let (status, _) = call(&state, "POST", "/invite/redeem", body, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    let (status, _) = call(
+        &state,
+        "POST",
+        "/auth/device",
+        json!({"vault_id": "vault-a", "peer_id": long, "device_key": "k"}),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn ensure_not_revoked_reflects_row_state() {
+    use crate::invites::ensure_not_revoked;
+    let state = test_state(test_db().await);
+    exec(
+        &state.db,
+        "INSERT INTO device_keys (vault_id, peer_id, key_hash, device_name) VALUES ('v', 'live', 'h', 'd'), ('v', 'gone', 'h', 'd')",
+    )
+    .await;
+    exec(
+        &state.db,
+        "UPDATE device_keys SET revoked_at = datetime('now') WHERE peer_id = 'gone'",
+    )
+    .await;
+    assert!(ensure_not_revoked(&state.db, "v", "live").await.unwrap());
+    assert!(!ensure_not_revoked(&state.db, "v", "gone").await.unwrap());
+    assert!(!ensure_not_revoked(&state.db, "v", "absent").await.unwrap());
+}

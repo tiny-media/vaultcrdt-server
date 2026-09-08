@@ -14,6 +14,8 @@ use std::io::{Cursor, SeekFrom};
 use std::path::{Path as FsPath, PathBuf};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
+use tracing::warn;
+
 use crate::{AppState, BroadcastEvent, VaultAuth, db::Db, errors::ServerError};
 
 /// Advertised PUT segment size. The route guard is this plus 4 KiB so a 4 MiB
@@ -252,6 +254,43 @@ async fn discard_upload(db: &Db, blob_dir: &FsPath, vault_id: &str, upload_id: &
         );
     }
     let _ = tokio::fs::remove_file(tmp_file_path(blob_dir, upload_id)).await;
+}
+
+/// Attempt to discard every expired upload (created_at older than 24 h),
+/// across all vaults. Returns the number of ATTEMPTED discards; failures
+/// are logged (warn) per upload and counted as attempted.
+pub async fn sweep_expired_uploads(db: &Db, blob_dir: &FsPath) -> Result<u64, ServerError> {
+    // Own the rows and release the DB lock: discard_upload re-acquires it.
+    let expired: Vec<(String, String)> = {
+        let conn = db.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT vault_id, upload_id FROM blob_uploads
+             WHERE created_at < datetime('now', '-24 hours')",
+        )?;
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+
+    let mut attempted = 0u64;
+    for (vault_id, upload_id) in expired {
+        discard_upload(db, blob_dir, &vault_id, &upload_id).await;
+        attempted += 1;
+        // discard_upload swallows its errors; verify the row is really gone so
+        // a persistent failure is at least visible in the log.
+        let still_there: Option<i64> = {
+            let conn = db.lock().await;
+            conn.query_row(
+                "SELECT 1 FROM blob_uploads WHERE upload_id = ? AND vault_id = ?",
+                params![&upload_id, &vault_id],
+                |r| r.get(0),
+            )
+            .optional()?
+        };
+        if still_there.is_some() {
+            warn!("upload sweeper: failed to discard upload {upload_id} (vault {vault_id})");
+        }
+    }
+    Ok(attempted)
 }
 
 fn parse_content_range(header: &str) -> Option<(u64, u64, u64)> {
@@ -906,6 +945,7 @@ pub async fn post_blob_path(
     Json(body): Json<BlobPathBody>,
 ) -> Result<Response, ServerError> {
     if body.peer_id.is_empty()
+        || body.peer_id.len() > crate::MAX_PEER_ID_BYTES
         || body.generation < 0
         || body.key_version != 1
         || (body.state != "live" && body.state != "deleted")
