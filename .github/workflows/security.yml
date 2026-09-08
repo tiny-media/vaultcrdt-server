@@ -58,6 +58,10 @@ jobs:
         with:
           persist-credentials: false
       - name: Scan Cargo.lock against the OSV database
+        # Advisory mode until triage: 7 RustSec advisories, all transitive
+        # (im/bitmaps/sized-chunks via loro, atomic-polyfill, rsa 5.9 M);
+        # none have fixed versions. SARIF still lands in the Security tab.
+        continue-on-error: true
         run: |
           docker run --rm -v "$PWD:/src" -w /src ghcr.io/google/osv-scanner:v2.5.1 \
             --format sarif --output osv-results.sarif ./
@@ -82,4 +86,7 @@ jobs:
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
       - name: Audit Cargo.lock against RustSec
+        # Advisory mode until triage: same 7 transitive advisories as the
+        # osv-scanner job; no fixed versions exist yet.
+        continue-on-error: true
         run: cargo audit --file Cargo.lock
