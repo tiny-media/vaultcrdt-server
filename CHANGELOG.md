@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-09-08
+
+### Fixed
+- A path with both a tombstone and a live documents row is live: pushes
+  are accepted instead of refused, and a replace-create merges into the
+  live document rather than replacing its identity. The stale tombstone
+  is removed in the same transaction that stores the snapshot, making
+  the both-rows state unreachable from doc_create. Tombstones without a
+  live row behave exactly as before.
+
 ## [0.4.2] - 2026-09-07
 
 ### Fixed
