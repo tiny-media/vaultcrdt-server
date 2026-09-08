@@ -12,10 +12,8 @@ async fn run_server() -> anyhow::Result<()> {
     let bind = std::env::var("VAULTCRDT_BIND").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     let db_path =
         std::env::var("VAULTCRDT_DB_PATH").unwrap_or_else(|_| "./vaultcrdt.db".to_string());
-    let jwt_secret =
-        std::env::var("VAULTCRDT_JWT_SECRET").expect("VAULTCRDT_JWT_SECRET must be set");
-    let admin_token =
-        std::env::var("VAULTCRDT_ADMIN_TOKEN").expect("VAULTCRDT_ADMIN_TOKEN must be set");
+    let jwt_secret = require_non_empty("VAULTCRDT_JWT_SECRET");
+    let admin_token = require_non_empty("VAULTCRDT_ADMIN_TOKEN");
 
     let database = db::open_db(&db_path).await?;
 
@@ -165,9 +163,30 @@ async fn main() {
     }
 }
 
+/// Read a required secret env var. Fails on UNSET and on EMPTY values: an
+/// empty JWT secret would sign tokens with publicly-known material, an empty
+/// admin token makes `constant_time_eq("", "")` accept every registration
+/// (security review 2026-09-08, finding 3). docker-compose.yml guards both
+/// via `${VAR:?…}`; the bare binary and plain `docker run` do not.
+fn require_non_empty(var: &str) -> String {
+    match require_non_empty_value(var, std::env::var(var)) {
+        Ok(value) => value,
+        Err(reason) => panic!("{reason}"),
+    }
+}
+
+/// Pure decision core of [`require_non_empty`], separated for testing.
+fn require_non_empty_value(var: &str, value: Result<String, std::env::VarError>) -> Result<String, String> {
+    match value {
+        Ok(v) if !v.is_empty() => Ok(v),
+        Ok(_) => Err(format!("{var} must not be empty")),
+        Err(_) => Err(format!("{var} must be set")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_PEER_RETENTION_DAYS, DEFAULT_TOMBSTONE_RETENTION_DAYS};
+    use super::{require_non_empty, DEFAULT_PEER_RETENTION_DAYS, DEFAULT_TOMBSTONE_RETENTION_DAYS};
 
     #[test]
     fn default_tombstone_retention_is_private_long_offline_safe() {
@@ -176,5 +195,19 @@ mod tests {
             DEFAULT_PEER_RETENTION_DAYS,
             DEFAULT_TOMBSTONE_RETENTION_DAYS
         );
+    }
+
+    #[test]
+    fn require_non_empty_rejects_unset_and_empty() {
+        use super::require_non_empty_value;
+        use std::env::VarError;
+        assert_eq!(
+            require_non_empty_value("V", Ok("secret".to_string())),
+            Ok("secret".to_string())
+        );
+        assert!(require_non_empty_value("V", Ok(String::new())).is_err());
+        assert!(require_non_empty_value("V", Err(VarError::NotPresent)).is_err());
+        assert!(require_non_empty_value("V", Err(VarError::NotUnicode("x".into())))
+            .is_err());
     }
 }
