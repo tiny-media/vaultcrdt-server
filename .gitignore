@@ -12,3 +12,6 @@ thoughts/shared/
 
 # v0.5 stable setup runtime
 _setup/_work/
+
+# internal session workspace (next/log/archive) — replacement for _setup/, 2026-09-08
+/dev/

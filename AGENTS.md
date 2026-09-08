@@ -5,6 +5,15 @@ live in the separate repo `../vaultcrdt-plugin`. Global behaviour rules live
 The maintainer's global development rules apply; this file carries only
 what differs for this repo.
 
+## Session entry and exit
+
+- Enter locally through `dev/next.md` (goal, open work, last
+  verification; untracked, ≤60 lines). Without local files, the public
+  docs are the entry: `docs/ARCHITECTURE.md`, `docs/ops-daily.md`.
+- History append-only in `dev/log.md`; frozen history in `dev/archive/`.
+- Exit = rewrite `dev/next.md`, append one `dev/log.md` entry, update the
+  durable doc that owns any fact that changed.
+
 ## Checks (gate before every commit)
 
 - `cargo fmt --all -- --check`, `cargo clippy --workspace --locked -- -D warnings`,
