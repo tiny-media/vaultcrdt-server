@@ -261,6 +261,36 @@ pub async fn store_snapshot_with_vv(
     Ok(())
 }
 
+/// Atomically store a snapshot and remove the path's tombstone.
+///
+/// Both statements run in ONE transaction: a failure rolls back the store, so
+/// a partial "live row + tombstone" state is unreachable from the
+/// delete→recreate (`replace_tombstone`) path.
+pub async fn store_snapshot_replacing_tombstone(
+    db: &Db,
+    vault_id: &str,
+    doc_uuid: &str,
+    snapshot: &[u8],
+    vv_blob: &[u8],
+) -> Result<(), ServerError> {
+    let mut conn = db.lock().await;
+    let tx = conn.transaction()?;
+    tx.execute(
+        "INSERT INTO documents (vault_id, doc_uuid, snapshot_blob, vv_blob) VALUES (?, ?, ?, ?) \
+         ON CONFLICT(vault_id, doc_uuid) DO UPDATE SET \
+           snapshot_blob = excluded.snapshot_blob, \
+           vv_blob = excluded.vv_blob, \
+           updated_at = datetime('now')",
+        params![vault_id, doc_uuid, snapshot, vv_blob],
+    )?;
+    tx.execute(
+        "DELETE FROM tombstones WHERE vault_id = ? AND doc_uuid = ?",
+        params![vault_id, doc_uuid],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 pub async fn get_snapshot_with_vv(
     db: &Db,
     vault_id: &str,

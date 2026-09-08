@@ -1214,6 +1214,131 @@ async fn test_doc_create_and_sync_push_without_replace_still_refuse_tombstone() 
     assert!(db::is_tombstoned(&db, "v", "dead.md").await.unwrap());
 }
 
+// ── Live row wins over a stale tombstone ───────────────────────────────────
+
+/// Seed the both-rows state (live document + tombstone for the same path).
+async fn seed_live_and_tombstone(db: &Db, doc_uuid: &str, text: &str) -> Vec<u8> {
+    use loro::{ExportMode, LoroDoc};
+    let doc = LoroDoc::new();
+    doc.get_text("text").insert(0, text).unwrap();
+    let snapshot = doc.export(ExportMode::Snapshot).unwrap();
+    let vv_blob = crate::vv_serde::vv_to_db_bytes(&doc.oplog_vv());
+    db::store_snapshot_with_vv(db, "v", doc_uuid, &snapshot, &vv_blob)
+        .await
+        .unwrap();
+    db::tombstone(db, "v", doc_uuid, "peer-del").await.unwrap();
+    snapshot
+}
+
+#[tokio::test]
+async fn test_sync_push_accepted_when_live_row_coexists_with_tombstone() {
+    use crate::handlers::process_message;
+    use crate::ws::msg;
+    use loro::{ExportMode, LoroDoc};
+
+    let db = test_db().await;
+    db::create_vault(&db, "v", "k").await.unwrap();
+    let doc_locks = DocLocks::default();
+    let base = seed_live_and_tombstone(&db, "recreated.md", "live").await;
+
+    // A delta on top of the live snapshot.
+    let doc = LoroDoc::new();
+    doc.import(&base).unwrap();
+    let base_vv = doc.oplog_vv();
+    doc.get_text("text").insert(4, "-more").unwrap();
+    let delta = doc
+        .export(ExportMode::updates(&std::borrow::Cow::Owned(base_vv)))
+        .unwrap();
+
+    let push = rmp_serde::to_vec_named(&msg::ClientMsg::SyncPush {
+        doc_uuid: "recreated.md".into(),
+        delta,
+        peer_id: "peer-new".into(),
+    })
+    .unwrap();
+    let (resp, broadcast) = process_message(&push, &db, "v", 1, &doc_locks).await;
+    assert!(matches!(resp, msg::ServerMsg::Ack), "got {resp:?}");
+    assert!(broadcast.is_some());
+
+    let (stored, _) = db::get_snapshot_with_vv(&db, "v", "recreated.md")
+        .await
+        .unwrap()
+        .unwrap();
+    let check = LoroDoc::new();
+    check.import(&stored).unwrap();
+    assert_eq!(check.get_text("text").to_string(), "live-more");
+}
+
+#[tokio::test]
+async fn test_doc_create_replace_on_both_rows_merges_and_drops_stale_tombstone() {
+    use crate::handlers::process_message;
+    use crate::ws::msg;
+    use loro::{ExportMode, LoroDoc};
+
+    let db = test_db().await;
+    db::create_vault(&db, "v", "k").await.unwrap();
+    let doc_locks = DocLocks::default();
+    let base = seed_live_and_tombstone(&db, "both.md", "live").await;
+
+    // Incoming snapshot shares history with the live row → merge, no identity swap.
+    let doc = LoroDoc::new();
+    doc.import(&base).unwrap();
+    doc.get_text("text").insert(4, "+client").unwrap();
+    let snapshot = doc.export(ExportMode::Snapshot).unwrap();
+
+    let create = rmp_serde::to_vec_named(&msg::ClientMsg::DocCreate {
+        doc_uuid: "both.md".into(),
+        snapshot,
+        peer_id: "peer-new".into(),
+        replace_tombstone: true,
+    })
+    .unwrap();
+    let (resp, broadcast) = process_message(&create, &db, "v", 1, &doc_locks).await;
+    assert!(matches!(resp, msg::ServerMsg::Ack), "got {resp:?}");
+    assert!(broadcast.is_some());
+    assert!(!db::is_tombstoned(&db, "v", "both.md").await.unwrap());
+
+    let (stored, _) = db::get_snapshot_with_vv(&db, "v", "both.md")
+        .await
+        .unwrap()
+        .unwrap();
+    let check = LoroDoc::new();
+    check.import(&stored).unwrap();
+    // Merge path: the pre-existing text survived (not identity-replaced).
+    assert_eq!(check.get_text("text").to_string(), "live+client");
+}
+
+#[tokio::test]
+async fn test_store_snapshot_replacing_tombstone_rolls_back_on_store_failure() {
+    let db = test_db().await;
+    db::create_vault(&db, "v", "k").await.unwrap();
+    db::tombstone(&db, "v", "atomic.md", "peer-del")
+        .await
+        .unwrap();
+
+    // Test seam: make the documents INSERT fail inside the transaction.
+    exec(
+        &db,
+        "CREATE TRIGGER fail_doc_insert BEFORE INSERT ON documents \
+         BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+    )
+    .await;
+
+    let err = db::store_snapshot_replacing_tombstone(&db, "v", "atomic.md", b"snap", b"vv").await;
+    assert!(err.is_err());
+
+    exec(&db, "DROP TRIGGER fail_doc_insert;").await;
+
+    // Neither the new snapshot nor a both-rows state: the tombstone still stands alone.
+    assert!(
+        db::get_snapshot_with_vv(&db, "v", "atomic.md")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(db::is_tombstoned(&db, "v", "atomic.md").await.unwrap());
+}
+
 // ── DocDelete / SyncPush race (regression for TOCTOU against tombstone) ─────
 
 #[tokio::test]
