@@ -1,0 +1,74 @@
+name: Security
+
+on:
+  push:
+    branches: [main]
+    tags: ["*"]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "31 4 * * 1"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  codeql:
+    name: CodeQL (rust, buildless)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      security-events: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          persist-credentials: false
+      - uses: github/codeql-action/init@v4
+        with:
+          languages: rust
+          queries: security-extended
+          build-mode: none
+      - uses: github/codeql-action/analyze@v4
+
+  build-locked:
+    name: cargo build --locked (compile check)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          persist-credentials: false
+      - name: Install Rust (pinned via rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build with locked dependencies
+        run: cargo build --locked
+
+  osv-scanner:
+    name: osv-scanner (Cargo.lock)
+    permissions:
+      contents: read
+      security-events: write
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@v2
+    with:
+      scan-args: |-
+        ./
+
+  cargo-audit:
+    name: cargo audit (RustSec)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          persist-credentials: false
+      - name: Install Rust (pinned via rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit Cargo.lock against RustSec
+        run: cargo audit --file Cargo.lock
