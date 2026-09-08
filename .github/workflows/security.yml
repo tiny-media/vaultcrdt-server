@@ -48,13 +48,24 @@ jobs:
 
   osv-scanner:
     name: osv-scanner (Cargo.lock)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     permissions:
       contents: read
       security-events: write
-    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@v2.5.1
-    with:
-      scan-args: |-
-        ./
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          persist-credentials: false
+      - name: Scan Cargo.lock against the OSV database
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src ghcr.io/google/osv-scanner:v2.5.1 \
+            --format sarif --output osv-results.sarif ./
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: osv-results.sarif
 
   cargo-audit:
     name: cargo audit (RustSec)
