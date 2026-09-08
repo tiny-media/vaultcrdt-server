@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-09-08
+
+### Security
+- **Identifier length caps**: WebSocket `doc_uuid` (1024 bytes) and
+  `peer_id` (128 bytes) are rejected after decoding before dispatch;
+  the WS query's `peer_id`/`device` over 128 bytes get HTTP 400 before
+  the upgrade; invite bodies and `/auth/device` enforce the same caps.
+  Bounds unbounded tombstone and metadata growth from an authenticated
+  peer (security review 2026-09-08, findings 5/N19).
+- **Abandoned uploads are swept**: a startup and hourly sweeper discards
+  upload rows and staging files older than 24 h across all vaults
+  (finding 9).
+- **Device re-auth rechecks revocation** after the argon2 verify and
+  before signing, narrowing the revocation race window (finding N2;
+  the residual race stays open until device binding, N1).
+
 ## [0.4.3] - 2026-09-08
 
 ### Fixed
