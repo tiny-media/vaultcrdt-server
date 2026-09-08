@@ -176,7 +176,10 @@ fn require_non_empty(var: &str) -> String {
 }
 
 /// Pure decision core of [`require_non_empty`], separated for testing.
-fn require_non_empty_value(var: &str, value: Result<String, std::env::VarError>) -> Result<String, String> {
+fn require_non_empty_value(
+    var: &str,
+    value: Result<String, std::env::VarError>,
+) -> Result<String, String> {
     match value {
         Ok(v) if !v.is_empty() => Ok(v),
         Ok(_) => Err(format!("{var} must not be empty")),
@@ -186,7 +189,7 @@ fn require_non_empty_value(var: &str, value: Result<String, std::env::VarError>)
 
 #[cfg(test)]
 mod tests {
-    use super::{require_non_empty, DEFAULT_PEER_RETENTION_DAYS, DEFAULT_TOMBSTONE_RETENTION_DAYS};
+    use super::{DEFAULT_PEER_RETENTION_DAYS, DEFAULT_TOMBSTONE_RETENTION_DAYS, require_non_empty};
 
     #[test]
     fn default_tombstone_retention_is_private_long_offline_safe() {
@@ -207,7 +210,6 @@ mod tests {
         );
         assert!(require_non_empty_value("V", Ok(String::new())).is_err());
         assert!(require_non_empty_value("V", Err(VarError::NotPresent)).is_err());
-        assert!(require_non_empty_value("V", Err(VarError::NotUnicode("x".into())))
-            .is_err());
+        assert!(require_non_empty_value("V", Err(VarError::NotUnicode("x".into()))).is_err());
     }
 }
