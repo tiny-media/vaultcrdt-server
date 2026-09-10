@@ -1,14 +1,17 @@
 # AGENTS.md — vaultcrdt-server
 
 Rust/Axum + SQLite sync server for VaultCRDT. Plugin, WASM and CRDT crates
-live in the separate repo `../vaultcrdt-plugin`. Global behaviour rules live
-The maintainer's global development rules apply; this file carries only
+live in the separate repo `../vaultcrdt-plugin`. The maintainer's global
+development rules apply; this file carries only
 what differs for this repo.
 
 ## Session entry and exit
 
 - Enter locally through `dev/next.md` (goal, open work, last
-  verification; untracked, ≤60 lines). Without local files, the public
+  verification; untracked, rewritten not appended, as long as it needs
+  to be — no line limit). When it outgrows one screen, move closed items
+  to the archive with a pointer; never squeeze at session end to hit a
+  number. Without local files, the public
   docs are the entry: `docs/ARCHITECTURE.md`, `docs/ops-daily.md`.
 - History append-only in `dev/log.md`; frozen history in `dev/archive/`.
 - Exit = rewrite `dev/next.md`, append one `dev/log.md` entry, update the
