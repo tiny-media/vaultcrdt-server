@@ -1057,3 +1057,249 @@ async fn sweeper_discards_expired_uploads_across_vaults() {
     assert!(!dir.join("tmp").join("old-2").exists());
     assert!(dir.join("tmp").join("fresh").exists());
 }
+#[cfg(test)]
+mod listing_fence_p1 {
+    use super::{hex, json_call, scalar, setup, upload_all};
+    use axum::http::StatusCode;
+    use serde_json::{Value, json};
+    use std::{
+        collections::{HashMap, HashSet},
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+    use tokio::sync::Barrier;
+
+    #[tokio::test]
+    async fn test_blob_listing_fence_premise_p1() {
+        // Brief v13, "P1 server pin": atomic allocation + accepted upsert,
+        // and a snapshot-consistent listing response, are the premise.
+        // MAX/rows order within one lock is only an implementation nicety.
+        // Assert the wire contract, not a particular locking implementation.
+        const N_W: usize = 4; // MAX_OPEN_UPLOADS is four; no retries or bypasses.
+        const N_R: usize = 4;
+        const TRANSITIONS: usize = 60;
+        const LIMIT: usize = 1000;
+        const WITNESS: &str = "pics/p1-witness.png";
+
+        struct Walk {
+            fence: i64,
+            applied: HashSet<(String, i64)>,
+            responses: Vec<Value>,
+            while_writers_ran: bool,
+        }
+
+        async fn publish(
+            app: &axum::Router,
+            token: &str,
+            path: &str,
+            generation: usize,
+            bytes: &[u8],
+        ) {
+            let hash = upload_all(app, token, bytes).await;
+            assert_eq!(hash, hex(bytes));
+            let (status, body) = json_call(
+                app,
+                "POST",
+                "/vault/blob-paths",
+                token,
+                Some(json!({
+                    "path_key": path,
+                    "display_path": path,
+                    "key_version": 1,
+                    "generation": generation,
+                    "state": "live",
+                    "content_hash": hash,
+                    "size": bytes.len(),
+                    "peer_id": "p1-writer",
+                })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["accepted"], true, "{body}");
+        }
+
+        let (app, state, _dir, token) = setup().await;
+        publish(&app, &token, WITNESS, 1, b"p1-stable-witness").await;
+        for writer in 0..N_W {
+            publish(
+                &app,
+                &token,
+                &format!("pics/p1-existing-{writer}.png"),
+                1,
+                format!("p1-seed-{writer}").as_bytes(),
+            )
+            .await;
+        }
+
+        let barrier = Arc::new(Barrier::new(N_W + N_R));
+        let active = Arc::new(AtomicUsize::new(N_W));
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let mut writers = Vec::new();
+        for writer in 0..N_W {
+            let (app, token) = (app.clone(), token.clone());
+            let (barrier, active, accepted) = (barrier.clone(), active.clone(), accepted.clone());
+            writers.push(tokio::spawn(async move {
+                barrier.wait().await;
+                for transition in 0..TRANSITIONS {
+                    // Writer-owned existing keys avoid LWW rejection while still
+                    // contending on the global allocator. Fresh keys stay current.
+                    let path = if transition % 2 == 0 {
+                        format!("pics/p1-existing-{writer}.png")
+                    } else {
+                        format!("pics/p1-fresh-{writer}-{transition}.png")
+                    };
+                    assert_ne!(path, WITNESS);
+                    let bytes = format!("p1-transition-{writer}-{transition}");
+                    publish(&app, &token, &path, transition + 2, bytes.as_bytes()).await;
+                    accepted.fetch_add(1, Ordering::SeqCst);
+                    tokio::task::yield_now().await;
+                }
+                active.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+
+        let mut readers = Vec::new();
+        for _ in 0..N_R {
+            let (app, token) = (app.clone(), token.clone());
+            let (barrier, active, accepted) = (barrier.clone(), active.clone(), accepted.clone());
+            readers.push(tokio::spawn(async move {
+                barrier.wait().await;
+                let mut walks = Vec::new();
+                while active.load(Ordering::SeqCst) != 0 {
+                    let writes_begun = accepted.load(Ordering::SeqCst) != 0;
+                    // Every independent walk starts at zero: containment is for
+                    // ALL final rows <= F, not just rows after a prior cursor.
+                    let mut p = 0i64;
+                    let mut fence = None;
+                    let mut applied = HashSet::new();
+                    let mut responses = Vec::new();
+                    loop {
+                        let (status, response) = json_call(
+                            &app,
+                            "GET",
+                            &format!("/vault/blob-paths?since_seq={p}&limit={LIMIT}"),
+                            &token,
+                            None,
+                        )
+                        .await;
+                        assert_eq!(status, StatusCode::OK, "{response}");
+                        let f = *fence.get_or_insert_with(|| {
+                            response["max_seq"].as_i64().expect("P1: missing max_seq")
+                        });
+                        let rows = response["states"].as_array().unwrap();
+                        let mut above_fence = false;
+                        for row in rows {
+                            let seq = row["seq"].as_i64().unwrap();
+                            if seq > f {
+                                above_fence = true;
+                                break;
+                            }
+                            // Also prevents a malformed page from looping forever.
+                            assert!(seq > p, "P1: listing did not advance past {p}: {row}");
+                            applied.insert((row["path_key"].as_str().unwrap().to_owned(), seq));
+                            p = seq;
+                        }
+                        let stop = above_fence || rows.len() < LIMIT || p == f;
+                        // Keep the whole response, including unapplied above-F rows.
+                        responses.push(response);
+                        if stop {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                    walks.push(Walk {
+                        fence: fence.unwrap(),
+                        applied,
+                        responses,
+                        while_writers_ran: writes_begun && active.load(Ordering::SeqCst) != 0,
+                    });
+                    tokio::task::yield_now().await;
+                }
+                walks
+            }));
+        }
+
+        for writer in writers {
+            writer.await.expect("P1 writer failed");
+        }
+        let mut walks = Vec::new();
+        for reader in readers {
+            walks.extend(reader.await.expect("P1 reader failed"));
+        }
+        assert_eq!(accepted.load(Ordering::SeqCst), N_W * TRANSITIONS);
+        let concurrent_walks = walks.iter().filter(|w| w.while_writers_ran).count();
+        assert!(
+            concurrent_walks >= 20,
+            "P1 test has no teeth: only {concurrent_walks} completed walks while writers ran; need >= 20"
+        );
+
+        // Independent final-state oracle via the existing scalar helper; no
+        // listing bug can hide a current row from the containment assertion.
+        let final_json: String = scalar(
+            &state.db,
+            "SELECT json_group_array(json_object('path_key', path_key,
+                'content_hash', content_hash, 'seq', seq))
+             FROM blob_path_states WHERE vault_id = 'v'",
+        )
+        .await;
+        let final_rows: Vec<Value> = serde_json::from_str(&final_json).unwrap();
+        assert_eq!(final_rows.len(), 1 + N_W + N_W * (TRANSITIONS / 2));
+        let witness = final_rows
+            .iter()
+            .find(|r| r["path_key"] == WITNESS)
+            .unwrap();
+        assert_eq!(witness["content_hash"], hex(b"p1-stable-witness"));
+
+        let mut seq_owners = HashMap::new();
+        for (walk_index, walk) in walks.iter().enumerate() {
+            for response in &walk.responses {
+                let max_seq = response["max_seq"].as_i64().unwrap();
+                let rows = response["states"].as_array().unwrap();
+                for row in rows {
+                    assert!(
+                        row["seq"].as_i64().unwrap() <= max_seq,
+                        "P1(i): walk {walk_index}, row {row} exceeds response max_seq {max_seq}"
+                    );
+                }
+                assert!(
+                    rows.windows(2).all(|pair| {
+                        pair[0]["seq"].as_i64().unwrap() < pair[1]["seq"].as_i64().unwrap()
+                    }),
+                    "P1(ii): walk {walk_index}, non-ascending page: {response}"
+                );
+            }
+            assert!(witness["seq"].as_i64().unwrap() <= walk.fence);
+            for row in &final_rows {
+                let seq = row["seq"].as_i64().unwrap();
+                let path = row["path_key"].as_str().unwrap().to_owned();
+                if seq <= walk.fence {
+                    assert!(
+                        walk.applied.contains(&(path, seq)),
+                        "P1(iii): walk {walk_index}, F={}, missing final row {row}",
+                        walk.fence
+                    );
+                }
+            }
+        }
+        for row in final_rows.iter().chain(walks.iter().flat_map(|walk| {
+            walk.responses
+                .iter()
+                .flat_map(|response| response["states"].as_array().unwrap())
+        })) {
+            let seq = row["seq"].as_i64().unwrap();
+            let identity = (
+                row["path_key"].as_str().unwrap().to_owned(),
+                row["content_hash"].as_str().unwrap().to_owned(),
+            );
+            if let Some(previous) = seq_owners.insert(seq, identity.clone()) {
+                // Re-observing the same accepted transition is legitimate.
+                assert_eq!(
+                    previous, identity,
+                    "P1(iv): distinct transitions share seq {seq}"
+                );
+            }
+        }
+    }
+}

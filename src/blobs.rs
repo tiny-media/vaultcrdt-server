@@ -1176,6 +1176,13 @@ struct StoredPath {
 }
 
 /// GET /vault/blob-paths
+///
+/// P1 listing-fence premise (n7-4): seq allocation and the accepted upsert
+/// must be atomic; `max_seq` and rows must describe one consistent snapshot,
+/// with rows strictly seq-ordered. Together these permit fixed-fence walks to
+/// contain every surviving row <= F. MAX-before-rows within one lock is an
+/// implementation nicety, not the premise. Pinned by
+/// `test_blob_listing_fence_premise_p1` (src/tests/blobs.rs).
 pub async fn list_blob_paths(
     State(state): State<AppState>,
     VaultAuth(vault_id): VaultAuth,
