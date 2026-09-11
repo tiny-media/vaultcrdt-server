@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-11
+
+### Added
+- **Incarnation-guarded document deletes (ADR 0006)**: a server-allocated,
+  vault-wide durable incarnation token now identifies every live edition of
+  a path. `doc_delete` accepts `expected_incarnation` (0 = expect absence):
+  a matching token deletes, a mismatch (including stale tokens after a
+  recreation) answers a requester-only `delete_rejected` with no mutation
+  and no broadcast — a stale delete can no longer destroy a newer
+  recreation. Migration 006 adds `documents.incarnation`,
+  `tombstones.incarnation` and the `vault_incarnation` counter (backfill 1,
+  seed 2; expiry never recycles tokens). Write frames carry an echoed
+  `request_id` (Ack/Error/DeleteRejected), establishing Acks carry the
+  token grant, `auth_ok` advertises the `delete_incarnation` capability,
+  and doc_list/sync_start/establishing broadcasts expose the token. All
+  wire additions are additive both directions; full protection requires
+  the new plugin (old peers keep today's unconditional-delete semantics).
+
+### Changed
+- SQLite `synchronous` is now `FULL` (was WAL default NORMAL): acked
+  commits survive power loss at ~0.02–0.03 ms extra per transaction
+  (maintainer decision 2026-09-11, measured on studio).
+
 ## [0.4.4] - 2026-09-08
 
 ### Security
