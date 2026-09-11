@@ -161,12 +161,12 @@ The server runs `PRAGMA wal_checkpoint(TRUNCATE)` and `PRAGMA optimize` once a w
 ```bash
 docker compose stop server
 sleep 5
-docker compose run --rm --no-deps server sqlite3 /var/lib/vaultcrdt/data.db "VACUUM; ANALYZE;"
+docker compose run --rm --no-deps server sqlite3 /var/lib/vaultcrdt/data.db "PRAGMA synchronous=FULL; VACUUM; ANALYZE;"
 docker compose start server
 curl http://your-server:8080/health
 ```
 
-Alternative without a container: `sqlite3 ./data/data.db "VACUUM; ANALYZE;"` on the host while the server is stopped.
+Alternative without a container: `sqlite3 ./data/data.db "PRAGMA synchronous=FULL; VACUUM; ANALYZE;"` on the host while the server is stopped.
 
 ### Restore drill
 

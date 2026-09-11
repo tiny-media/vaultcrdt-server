@@ -226,7 +226,7 @@ Tombstones are sticky until retention. There is no server-side resurrection logi
 
 ### Storage
 
-SQLite via `rusqlite` 0.40 (bundled SQLite 3.53.2), WAL mode, `synchronous = NORMAL`, `busy_timeout = 5000`, `foreign_keys = ON`. One connection per process behind a `tokio::sync::Mutex` (`db::Db`); call sites take the lock and run the query synchronously. Migrations are embedded (`include_str!` of `migrations/*.sql`, applied by `rusqlite_migration`) and run on startup; the applied count is tracked in `PRAGMA user_version`. Databases created by the previous sqlx runner are adopted once on open: `user_version` is seeded from `_sqlx_migrations`, then that table is dropped.
+SQLite via `rusqlite` 0.40 (bundled SQLite 3.53.2), WAL mode, `synchronous = FULL` (power-loss durability for acknowledged commits), `busy_timeout = 5000`, `foreign_keys = ON`. One connection per process behind a `tokio::sync::Mutex` (`db::Db`); call sites take the lock and run the query synchronously. Migrations are embedded (`include_str!` of `migrations/*.sql`, applied by `rusqlite_migration`) and run on startup; the applied count is tracked in `PRAGMA user_version`. Databases created by the previous sqlx runner are adopted once on open: `user_version` is seeded from `_sqlx_migrations`, then that table is dropped.
 
 | Migration | Contents |
 |---|---|

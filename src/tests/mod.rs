@@ -515,6 +515,19 @@ async fn test_expire_tombstones_after_stale_peer_is_forgotten() {
 // ── Migration adoption from the old sqlx runner ─────────────────────────────
 
 #[tokio::test]
+async fn test_open_db_sets_synchronous_full() {
+    // Durability decision 2026-09-11: acknowledged commits must survive
+    // power loss; PRAGMA synchronous on the live connection must report 2
+    // (FULL), not 1 (NORMAL).
+    let db = db::open_db(":memory:").await.expect("open in-memory db");
+    let conn = db.lock().await;
+    let mode: i64 = conn
+        .query_row("PRAGMA synchronous", [], |r| r.get(0))
+        .expect("read synchronous pragma");
+    assert_eq!(mode, 2, "synchronous must be FULL (2), got {mode}");
+}
+
+#[tokio::test]
 async fn test_open_db_adopts_existing_sqlx_migration_state() {
     // A production DB written by the sqlx runner: schema applied, migration
     // bookkeeping in _sqlx_migrations, user_version still 0.

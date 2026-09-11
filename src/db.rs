@@ -77,7 +77,11 @@ pub async fn open_db(db_path: &str) -> Result<Db, ServerError> {
     let _: String = conn
         .query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))
         .map_err(ServerError::Db)?;
-    conn.pragma_update(None, "synchronous", "NORMAL")
+    // Durability: FULL syncs the WAL at each transaction commit for
+    // power-loss durability, assuming the storage stack honors sync
+    // requests (NORMAL trades that for speed). Maintainer decision
+    // 2026-09-11 after measuring ~0.02-0.03 ms extra per commit locally.
+    conn.pragma_update(None, "synchronous", "FULL")
         .map_err(ServerError::Db)?;
     conn.pragma_update(None, "busy_timeout", 5000)
         .map_err(ServerError::Db)?;
