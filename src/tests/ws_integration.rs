@@ -71,7 +71,8 @@ async fn ws_connect(
     assert!(matches!(
         recv_msg(&mut stream).await,
         msg::ServerMsg::AuthOk {
-            protocol_version: 1
+            protocol_version: 1,
+            ..
         }
     ));
     (sink, stream)
@@ -180,7 +181,8 @@ async fn test_ws_auth_happy_path() {
     assert!(matches!(
         recv_msg(&mut stream).await,
         msg::ServerMsg::AuthOk {
-            protocol_version: 1
+            protocol_version: 1,
+            ..
         }
     ));
     send_msg(&mut sink, &msg::ClientMsg::Ping).await;
@@ -213,7 +215,7 @@ async fn test_ws_protocol_version_mismatch() {
     )
     .await;
     match recv_msg(&mut stream).await {
-        msg::ServerMsg::Error { code, message } => {
+        msg::ServerMsg::Error { code, message, .. } => {
             assert_eq!(code, "protocol_version_mismatch");
             assert_eq!(message, "server=1 client=99");
         }
@@ -288,7 +290,7 @@ async fn test_ws_post_auth_auth_is_bad_frame_without_close() {
     )
     .await;
     match recv_msg(&mut stream).await {
-        msg::ServerMsg::Error { code, message } => {
+        msg::ServerMsg::Error { code, message, .. } => {
             assert_eq!(code, "bad_frame");
             assert_eq!(message, "message could not be decoded");
         }
@@ -345,6 +347,7 @@ async fn test_ws_doc_create_and_list() {
     send_msg(
         &mut sink,
         &msg::ClientMsg::DocCreate {
+            request_id: None,
             doc_uuid: "note.md".to_string(),
             snapshot,
             peer_id: "42".to_string(),
@@ -354,7 +357,7 @@ async fn test_ws_doc_create_and_list() {
     .await;
 
     match recv_msg(&mut stream).await {
-        msg::ServerMsg::Ack => {}
+        msg::ServerMsg::Ack { .. } => {}
         other => panic!("expected Ack, got {other:?}"),
     }
 
@@ -411,6 +414,7 @@ async fn test_ws_sync_start_full_snapshot() {
     send_msg(
         &mut sink,
         &msg::ClientMsg::DocCreate {
+            request_id: None,
             doc_uuid: "note.md".to_string(),
             snapshot,
             peer_id: "42".to_string(),
@@ -435,6 +439,7 @@ async fn test_ws_sync_start_full_snapshot() {
             doc_uuid,
             delta,
             server_vv,
+            ..
         } => {
             assert_eq!(doc_uuid, "note.md");
             assert!(!delta.is_empty());
@@ -464,6 +469,7 @@ async fn test_ws_sync_start_incremental_delta() {
     send_msg(
         &mut sink,
         &msg::ClientMsg::DocCreate {
+            request_id: None,
             doc_uuid: "note.md".to_string(),
             snapshot,
             peer_id: "42".to_string(),
@@ -482,6 +488,7 @@ async fn test_ws_sync_start_incremental_delta() {
     send_msg(
         &mut sink,
         &msg::ClientMsg::SyncPush {
+            request_id: None,
             doc_uuid: "note.md".to_string(),
             delta,
             peer_id: "42".to_string(),
@@ -529,6 +536,7 @@ async fn test_ws_sync_push_and_broadcast() {
     send_msg(
         &mut sink_a,
         &msg::ClientMsg::DocCreate {
+            request_id: None,
             doc_uuid: "note.md".to_string(),
             snapshot: snapshot.clone(),
             peer_id: "100".to_string(),
@@ -567,6 +575,7 @@ async fn test_ws_sync_push_and_broadcast() {
     send_msg(
         &mut sink_a,
         &msg::ClientMsg::SyncPush {
+            request_id: None,
             doc_uuid: "note.md".to_string(),
             delta,
             peer_id: "100".to_string(),
@@ -625,6 +634,7 @@ async fn test_ws_concurrent_sync_push_merge() {
     send_msg(
         &mut sink_a,
         &msg::ClientMsg::DocCreate {
+            request_id: None,
             doc_uuid: "note.md".to_string(),
             snapshot: base_snapshot.clone(),
             peer_id: "1".to_string(),
@@ -655,6 +665,7 @@ async fn test_ws_concurrent_sync_push_merge() {
     send_msg(
         &mut sink_a,
         &msg::ClientMsg::SyncPush {
+            request_id: None,
             doc_uuid: "note.md".to_string(),
             delta: delta_a.clone(),
             peer_id: "100".to_string(),
@@ -667,6 +678,7 @@ async fn test_ws_concurrent_sync_push_merge() {
     send_msg(
         &mut sink_b,
         &msg::ClientMsg::SyncPush {
+            request_id: None,
             doc_uuid: "note.md".to_string(),
             delta: delta_b.clone(),
             peer_id: "200".to_string(),
@@ -677,7 +689,7 @@ async fn test_ws_concurrent_sync_push_merge() {
     // B may get A's broadcast before its own Ack — drain until we see Ack
     loop {
         match recv_msg(&mut stream_b).await {
-            msg::ServerMsg::Ack => break,
+            msg::ServerMsg::Ack { .. } => break,
             msg::ServerMsg::DeltaBroadcast { .. } => continue, // A's broadcast
             other => panic!("unexpected from B: {other:?}"),
         }
@@ -712,6 +724,7 @@ async fn test_ws_doc_delete_and_broadcast() {
     send_msg(
         &mut sink_a,
         &msg::ClientMsg::DocCreate {
+            request_id: None,
             doc_uuid: "note.md".to_string(),
             snapshot,
             peer_id: "42".to_string(),
@@ -726,13 +739,16 @@ async fn test_ws_doc_delete_and_broadcast() {
     send_msg(
         &mut sink_a,
         &msg::ClientMsg::DocDelete {
+            request_id: None,
+            expected_incarnation: None,
+            intent_id: None,
             doc_uuid: "note.md".to_string(),
             peer_id: "peer-a".to_string(),
         },
     )
     .await;
     match recv_msg(&mut stream_a).await {
-        msg::ServerMsg::Ack => {}
+        msg::ServerMsg::Ack { .. } => {}
         other => panic!("expected Ack, got {other:?}"),
     }
 
@@ -763,13 +779,16 @@ async fn test_ws_doc_delete_and_broadcast() {
     send_msg(
         &mut sink_a,
         &msg::ClientMsg::DocDelete {
+            request_id: None,
+            expected_incarnation: None,
+            intent_id: None,
             doc_uuid: "note.md".to_string(),
             peer_id: "peer-a".to_string(),
         },
     )
     .await;
     match recv_msg(&mut stream_a).await {
-        msg::ServerMsg::Ack => {}
+        msg::ServerMsg::Ack { .. } => {}
         other => panic!("expected Ack on re-delete, got {other:?}"),
     }
     match recv_msg(&mut stream_b).await {
@@ -825,6 +844,7 @@ async fn test_ws_vault_isolation() {
     send_msg(
         &mut sink_a,
         &msg::ClientMsg::DocCreate {
+            request_id: None,
             doc_uuid: "note.md".to_string(),
             snapshot,
             peer_id: "42".to_string(),
@@ -904,6 +924,7 @@ async fn test_ws_corrupted_loro_delta_returns_error() {
     send_msg(
         &mut sink,
         &msg::ClientMsg::DocCreate {
+            request_id: None,
             doc_uuid: "note.md".to_string(),
             snapshot,
             peer_id: "42".to_string(),
@@ -917,6 +938,7 @@ async fn test_ws_corrupted_loro_delta_returns_error() {
     send_msg(
         &mut sink,
         &msg::ClientMsg::SyncPush {
+            request_id: None,
             doc_uuid: "note.md".to_string(),
             delta: vec![0xDE, 0xAD, 0xBE, 0xEF],
             peer_id: "42".to_string(),
@@ -925,7 +947,7 @@ async fn test_ws_corrupted_loro_delta_returns_error() {
     .await;
 
     match recv_msg(&mut stream).await {
-        msg::ServerMsg::Error { code, message } => {
+        msg::ServerMsg::Error { code, message, .. } => {
             assert_eq!(code, "sync_failed");
             assert!(!message.contains("loro"));
             assert_eq!(message, "document could not be processed — not synced");
@@ -948,7 +970,7 @@ async fn test_ws_invalid_msgpack_returns_error() {
         .unwrap();
 
     match recv_msg(&mut stream).await {
-        msg::ServerMsg::Error { code, message } => {
+        msg::ServerMsg::Error { code, message, .. } => {
             assert_eq!(code, "bad_frame");
             assert!(!message.contains("msgpack"));
         }
@@ -982,6 +1004,7 @@ async fn test_ws_full_lifecycle() {
     send_msg(
         &mut sink,
         &msg::ClientMsg::DocCreate {
+            request_id: None,
             doc_uuid: "test.md".to_string(),
             snapshot,
             peer_id: "42".to_string(),
@@ -989,7 +1012,10 @@ async fn test_ws_full_lifecycle() {
         },
     )
     .await;
-    assert!(matches!(recv_msg(&mut stream).await, msg::ServerMsg::Ack));
+    assert!(matches!(
+        recv_msg(&mut stream).await,
+        msg::ServerMsg::Ack { .. }
+    ));
 
     // 3. Push update
     let vv = doc.oplog_vv();
@@ -1001,13 +1027,17 @@ async fn test_ws_full_lifecycle() {
     send_msg(
         &mut sink,
         &msg::ClientMsg::SyncPush {
+            request_id: None,
             doc_uuid: "test.md".to_string(),
             delta,
             peer_id: "42".to_string(),
         },
     )
     .await;
-    assert!(matches!(recv_msg(&mut stream).await, msg::ServerMsg::Ack));
+    assert!(matches!(
+        recv_msg(&mut stream).await,
+        msg::ServerMsg::Ack { .. }
+    ));
 
     // 4. SyncStart → should get updated content
     send_msg(
@@ -1031,12 +1061,18 @@ async fn test_ws_full_lifecycle() {
     send_msg(
         &mut sink,
         &msg::ClientMsg::DocDelete {
+            request_id: None,
+            expected_incarnation: None,
+            intent_id: None,
             doc_uuid: "test.md".to_string(),
             peer_id: "peer-1".to_string(),
         },
     )
     .await;
-    assert!(matches!(recv_msg(&mut stream).await, msg::ServerMsg::Ack));
+    assert!(matches!(
+        recv_msg(&mut stream).await,
+        msg::ServerMsg::Ack { .. }
+    ));
 
     // 6. Verify tombstone in doc list
     send_msg(&mut sink, &msg::ClientMsg::RequestDocList).await;
@@ -1086,7 +1122,8 @@ async fn test_ws_blob_path_changed_only_with_blobs_feature() {
     assert!(matches!(
         recv_msg(&mut stream_blobs).await,
         msg::ServerMsg::AuthOk {
-            protocol_version: 1
+            protocol_version: 1,
+            ..
         }
     ));
 

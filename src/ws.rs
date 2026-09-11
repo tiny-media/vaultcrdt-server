@@ -44,6 +44,8 @@ pub mod msg {
             #[serde(with = "serde_bytes")]
             delta: Vec<u8>,
             peer_id: String,
+            #[serde(default)]
+            request_id: Option<String>,
         },
         DocCreate {
             doc_uuid: String,
@@ -52,10 +54,18 @@ pub mod msg {
             peer_id: String,
             #[serde(default)]
             replace_tombstone: bool,
+            #[serde(default)]
+            request_id: Option<String>,
         },
         DocDelete {
             doc_uuid: String,
             peer_id: String,
+            #[serde(default)]
+            expected_incarnation: Option<i64>,
+            #[serde(default)]
+            intent_id: Option<String>,
+            #[serde(default)]
+            request_id: Option<String>,
         },
     }
 
@@ -64,12 +74,28 @@ pub mod msg {
     pub enum ServerMsg {
         AuthOk {
             protocol_version: u32,
+            #[serde(default)]
+            capabilities: Option<Vec<String>>,
         },
         Pong,
-        Ack,
+        Ack {
+            #[serde(default)]
+            incarnation: Option<i64>,
+            #[serde(default)]
+            request_id: Option<String>,
+        },
         Error {
             code: String,
             message: String,
+            #[serde(default)]
+            request_id: Option<String>,
+        },
+        DeleteRejected {
+            doc_uuid: String,
+            #[serde(default)]
+            intent_id: Option<String>,
+            #[serde(default)]
+            request_id: Option<String>,
         },
         DocList {
             docs: Vec<db::DocEntry>,
@@ -82,6 +108,8 @@ pub mod msg {
             delta: Vec<u8>,
             #[serde(with = "serde_bytes")]
             server_vv: Vec<u8>,
+            #[serde(default)]
+            incarnation: Option<i64>,
         },
         DocUnknown {
             doc_uuid: String,
@@ -93,6 +121,8 @@ pub mod msg {
             peer_id: String,
             #[serde(with = "serde_bytes")]
             server_vv: Vec<u8>,
+            #[serde(default)]
+            incarnation: Option<i64>,
         },
         DocDeleted {
             doc_uuid: String,
@@ -195,6 +225,7 @@ async fn handle_socket(
         let response = msg::ServerMsg::Error {
             code: "protocol_version_mismatch".into(),
             message: format!("server={PROTOCOL_VERSION} client={protocol_version}"),
+            request_id: None,
         };
         if let Ok(bytes) = rmp_serde::to_vec_named(&response) {
             let _ = socket.send(Message::Binary(bytes.into())).await;
@@ -204,6 +235,7 @@ async fn handle_socket(
     }
     let Ok(bytes) = rmp_serde::to_vec_named(&msg::ServerMsg::AuthOk {
         protocol_version: PROTOCOL_VERSION,
+        capabilities: Some(vec!["delete_incarnation".into()]),
     }) else {
         return;
     };
@@ -286,6 +318,7 @@ async fn handle_socket(
                         );
                         let err = self::msg::ServerMsg::Error {
                             code: "frame_too_large".into(),
+                            request_id: None,
                             message: format!(
                                 "frame too large ({} bytes, limit 50 MiB) — document not synced",
                                 data.len()
@@ -334,12 +367,14 @@ async fn handle_socket(
                     peer_id,
                     sender_conn_id,
                     server_vv,
+                    incarnation,
                 }) if evt_vault == vault_id && sender_conn_id != conn_id => {
                     let msg = msg::ServerMsg::DeltaBroadcast {
                         doc_uuid,
                         delta,
                         peer_id,
                         server_vv,
+                        incarnation,
                     };
                     let Ok(bytes) = rmp_serde::to_vec_named(&msg) else {
                         break;

@@ -3,8 +3,8 @@ use loro::{ExportMode, LoroDoc};
 use tracing::{debug, info};
 
 use crate::{
-    BroadcastEvent, DocLocks, MAX_DOC_UUID_BYTES, MAX_PEER_ID_BYTES, db, errors::ServerError,
-    vv_serde, ws::msg,
+    BroadcastEvent, DocLocks, MAX_DOC_UUID_BYTES, MAX_PEER_ID_BYTES, MAX_REQUEST_ID_BYTES, db,
+    errors::ServerError, vv_serde, ws::msg,
 };
 
 /// Reject over-long identifiers before dispatch. The client-facing text of
@@ -35,8 +35,30 @@ pub async fn process_message(
     conn_id: u64,
     doc_locks: &DocLocks,
 ) -> (msg::ServerMsg, Option<BroadcastEvent>) {
-    match process_inner(data, db, vault_id, conn_id, doc_locks).await {
-        Ok(result) => result,
+    let parsed: Result<msg::ClientMsg, _> = rmp_serde::from_slice(data)
+        .map_err(|e| ServerError::BadFrame(format!("invalid msgpack: {e}")));
+    let request_id = match &parsed {
+        Ok(
+            msg::ClientMsg::SyncPush { request_id, .. }
+            | msg::ClientMsg::DocCreate { request_id, .. }
+            | msg::ClientMsg::DocDelete { request_id, .. },
+        ) => request_id.clone(),
+        _ => None,
+    };
+    let result = match parsed {
+        Ok(msg) => process_inner(msg, db, vault_id, conn_id, doc_locks).await,
+        Err(e) => Err(e),
+    };
+    match result {
+        Ok((mut response, broadcast)) => {
+            if let msg::ServerMsg::Ack {
+                request_id: echo, ..
+            } = &mut response
+            {
+                *echo = request_id;
+            }
+            (response, broadcast)
+        }
         Err(e) => {
             let (code, message) = e.client_facing();
             // Decoder errors may echo raw client bytes, including credentials.
@@ -51,6 +73,7 @@ pub async fn process_message(
                 msg::ServerMsg::Error {
                     code: code.into(),
                     message: message.into(),
+                    request_id,
                 },
                 None,
             )
@@ -59,31 +82,62 @@ pub async fn process_message(
 }
 
 async fn process_inner(
-    data: &[u8],
+    msg: msg::ClientMsg,
     db: &Db,
     vault_id: &str,
     conn_id: u64,
     doc_locks: &DocLocks,
 ) -> Result<(msg::ServerMsg, Option<BroadcastEvent>), ServerError> {
-    let msg: msg::ClientMsg = rmp_serde::from_slice(data)
-        .map_err(|e| ServerError::BadFrame(format!("invalid msgpack: {e}")))?;
-
     // Identifier caps (#5/N19): before dispatch and before any DocLocks work.
     match &msg {
         msg::ClientMsg::SyncStart { doc_uuid, .. } => {
             check_len("doc_uuid", doc_uuid, MAX_DOC_UUID_BYTES, vault_id, conn_id)?;
         }
         msg::ClientMsg::SyncPush {
-            doc_uuid, peer_id, ..
+            doc_uuid,
+            peer_id,
+            request_id,
+            ..
         }
         | msg::ClientMsg::DocCreate {
-            doc_uuid, peer_id, ..
+            doc_uuid,
+            peer_id,
+            request_id,
+            ..
         }
-        | msg::ClientMsg::DocDelete { doc_uuid, peer_id } => {
+        | msg::ClientMsg::DocDelete {
+            doc_uuid,
+            peer_id,
+            request_id,
+            ..
+        } => {
             check_len("doc_uuid", doc_uuid, MAX_DOC_UUID_BYTES, vault_id, conn_id)?;
             check_len("peer_id", peer_id, MAX_PEER_ID_BYTES, vault_id, conn_id)?;
+            if let Some(request_id) = request_id {
+                check_len(
+                    "request_id",
+                    request_id,
+                    MAX_REQUEST_ID_BYTES,
+                    vault_id,
+                    conn_id,
+                )?;
+            }
         }
         _ => {}
+    }
+
+    if let msg::ClientMsg::DocDelete {
+        intent_id: Some(intent_id),
+        ..
+    } = &msg
+    {
+        check_len(
+            "intent_id",
+            intent_id,
+            MAX_REQUEST_ID_BYTES,
+            vault_id,
+            conn_id,
+        )?;
     }
 
     match msg {
@@ -118,6 +172,7 @@ async fn process_inner(
             doc_uuid,
             delta,
             peer_id,
+            ..
         } => {
             let lock_key = DocLocks::lock_key(vault_id, &doc_uuid);
             let lock = doc_locks.get(&lock_key);
@@ -130,6 +185,7 @@ async fn process_inner(
             snapshot,
             peer_id,
             replace_tombstone,
+            ..
         } => {
             let lock_key = DocLocks::lock_key(vault_id, &doc_uuid);
             let lock = doc_locks.get(&lock_key);
@@ -146,15 +202,36 @@ async fn process_inner(
             .await
         }
 
-        msg::ClientMsg::DocDelete { doc_uuid, peer_id } => {
+        msg::ClientMsg::DocDelete {
+            doc_uuid,
+            peer_id,
+            expected_incarnation,
+            intent_id,
+            request_id,
+        } => {
             // Serialise with sync_push / doc_create on the same doc: the
             // tombstone guard in those handlers is a TOCTOU check that only
             // holds if delete, push and create are mutually exclusive.
             let lock_key = DocLocks::lock_key(vault_id, &doc_uuid);
             let lock = doc_locks.get(&lock_key);
             let _guard = lock.lock().await;
-            let content_hash =
-                db::delete_doc_and_tombstone(db, vault_id, &doc_uuid, &peer_id).await?;
+            let outcome =
+                db::delete_doc_guarded(db, vault_id, &doc_uuid, &peer_id, expected_incarnation)
+                    .await?;
+            let content_hash = match outcome {
+                db::DeleteOutcome::Deleted { content_hash, .. }
+                | db::DeleteOutcome::IdempotentNoLive { content_hash } => content_hash,
+                db::DeleteOutcome::Rejected { .. } => {
+                    return Ok((
+                        msg::ServerMsg::DeleteRejected {
+                            doc_uuid,
+                            intent_id,
+                            request_id,
+                        },
+                        None,
+                    ));
+                }
+            };
             debug!("doc_delete: vault={vault_id}, doc={doc_uuid}");
             let broadcast = BroadcastEvent::Delete {
                 vault_id: vault_id.to_string(),
@@ -162,7 +239,13 @@ async fn process_inner(
                 sender_conn_id: conn_id,
                 content_hash,
             };
-            Ok((msg::ServerMsg::Ack, Some(broadcast)))
+            Ok((
+                msg::ServerMsg::Ack {
+                    incarnation: None,
+                    request_id,
+                },
+                Some(broadcast),
+            ))
         }
     }
 }
@@ -175,9 +258,9 @@ async fn handle_sync_start(
     doc_uuid: &str,
     client_vv_bytes: Option<&[u8]>,
 ) -> Result<(msg::ServerMsg, Option<BroadcastEvent>), ServerError> {
-    let existing = db::get_snapshot_with_vv(db, vault_id, doc_uuid).await?;
+    let existing = db::get_snapshot_with_incarnation(db, vault_id, doc_uuid).await?;
 
-    let Some((snapshot_blob, _vv_blob)) = existing else {
+    let Some((snapshot_blob, incarnation)) = existing else {
         debug!("sync_start: vault={vault_id}, doc={doc_uuid} → DocUnknown");
         return Ok((
             msg::ServerMsg::DocUnknown {
@@ -209,6 +292,7 @@ async fn handle_sync_start(
                     doc_uuid: doc_uuid.to_string(),
                     delta,
                     server_vv: server_vv_json,
+                    incarnation: Some(incarnation),
                 },
                 None,
             ))
@@ -223,6 +307,7 @@ async fn handle_sync_start(
                     doc_uuid: doc_uuid.to_string(),
                     delta: snapshot_blob,
                     server_vv: server_vv_json,
+                    incarnation: Some(incarnation),
                 },
                 None,
             ))
@@ -291,7 +376,9 @@ async fn handle_sync_push(
     let new_vv = doc.oplog_vv();
     let new_vv_blob = vv_serde::vv_to_db_bytes(&new_vv);
 
-    db::store_snapshot_with_vv(db, vault_id, doc_uuid, &new_snapshot, &new_vv_blob).await?;
+    let token =
+        db::store_snapshot_with_vv(db, vault_id, doc_uuid, &new_snapshot, &new_vv_blob).await?;
+    let incarnation = existing.is_none().then_some(token);
 
     debug!(
         "sync_push: vault={vault_id}, doc={doc_uuid}, delta={}b, snapshot={}b",
@@ -307,9 +394,16 @@ async fn handle_sync_push(
         peer_id: peer_id.to_string(),
         sender_conn_id: conn_id,
         server_vv: server_vv_json,
+        incarnation,
     };
 
-    Ok((msg::ServerMsg::Ack, Some(broadcast)))
+    Ok((
+        msg::ServerMsg::Ack {
+            incarnation,
+            request_id: None,
+        },
+        Some(broadcast),
+    ))
 }
 
 // ── DocCreate ───────────────────────────────────────────────────────────────
@@ -397,12 +491,14 @@ async fn handle_doc_create(
 
     // Store and tombstone removal happen in ONE transaction, so a failure can
     // never leave a live row next to a lingering tombstone (or vice versa).
-    if effective_replace || clear_stale_tombstone {
+    let token = if effective_replace || clear_stale_tombstone {
         db::store_snapshot_replacing_tombstone(db, vault_id, doc_uuid, &new_snapshot, &new_vv_blob)
-            .await?;
+            .await?
     } else {
-        db::store_snapshot_with_vv(db, vault_id, doc_uuid, &new_snapshot, &new_vv_blob).await?;
-    }
+        db::store_snapshot_with_vv(db, vault_id, doc_uuid, &new_snapshot, &new_vv_blob).await?
+    };
+    let incarnation =
+        (existing.is_none() || effective_replace || clear_stale_tombstone).then_some(token);
 
     debug!(
         "doc_create: vault={vault_id}, doc={doc_uuid}, snapshot={}b, existing={}, replace_tombstone={}",
@@ -419,7 +515,14 @@ async fn handle_doc_create(
         peer_id: peer_id.to_string(),
         sender_conn_id: conn_id,
         server_vv: server_vv_json,
+        incarnation,
     };
 
-    Ok((msg::ServerMsg::Ack, Some(broadcast)))
+    Ok((
+        msg::ServerMsg::Ack {
+            incarnation,
+            request_id: None,
+        },
+        Some(broadcast),
+    ))
 }

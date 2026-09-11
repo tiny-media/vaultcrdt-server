@@ -1,5 +1,7 @@
 mod blobs;
 mod cli;
+mod incarnation;
+mod incarnation_raw_frame;
 mod invites;
 mod ws_integration;
 
@@ -556,7 +558,7 @@ async fn test_open_db_adopts_existing_sqlx_migration_state() {
     }
 
     let db = db::open_db(path.to_str().unwrap()).await.unwrap();
-    assert_eq!(scalar::<i64>(&db, "PRAGMA user_version").await, 5);
+    assert_eq!(scalar::<i64>(&db, "PRAGMA user_version").await, 6);
     assert_eq!(
         scalar::<i64>(
             &db,
@@ -1161,6 +1163,7 @@ async fn test_doc_create_replace_tombstone_removes_tombstone_and_stores_doc() {
     let snapshot = doc.export(ExportMode::Snapshot).unwrap();
 
     let create_msg = rmp_serde::to_vec_named(&msg::ClientMsg::DocCreate {
+        request_id: None,
         doc_uuid: "same.md".into(),
         snapshot,
         peer_id: "peer-new".into(),
@@ -1169,7 +1172,7 @@ async fn test_doc_create_replace_tombstone_removes_tombstone_and_stores_doc() {
     .unwrap();
 
     let (resp, broadcast) = process_message(&create_msg, &db, "v", 1, &doc_locks).await;
-    assert!(matches!(resp, msg::ServerMsg::Ack));
+    assert!(matches!(resp, msg::ServerMsg::Ack { .. }));
     assert!(broadcast.is_some());
     assert!(!db::is_tombstoned(&db, "v", "same.md").await.unwrap());
     assert!(
@@ -1198,6 +1201,7 @@ async fn test_doc_create_and_sync_push_without_replace_still_refuse_tombstone() 
     let snapshot = doc.export(ExportMode::Snapshot).unwrap();
 
     let blind_create = rmp_serde::to_vec_named(&msg::ClientMsg::DocCreate {
+        request_id: None,
         doc_uuid: "dead.md".into(),
         snapshot: snapshot.clone(),
         peer_id: "peer-stale".into(),
@@ -1216,6 +1220,7 @@ async fn test_doc_create_and_sync_push_without_replace_still_refuse_tombstone() 
     );
 
     let stale_push = rmp_serde::to_vec_named(&msg::ClientMsg::SyncPush {
+        request_id: None,
         doc_uuid: "dead.md".into(),
         delta: snapshot,
         peer_id: "peer-stale".into(),
@@ -1264,13 +1269,14 @@ async fn test_sync_push_accepted_when_live_row_coexists_with_tombstone() {
         .unwrap();
 
     let push = rmp_serde::to_vec_named(&msg::ClientMsg::SyncPush {
+        request_id: None,
         doc_uuid: "recreated.md".into(),
         delta,
         peer_id: "peer-new".into(),
     })
     .unwrap();
     let (resp, broadcast) = process_message(&push, &db, "v", 1, &doc_locks).await;
-    assert!(matches!(resp, msg::ServerMsg::Ack), "got {resp:?}");
+    assert!(matches!(resp, msg::ServerMsg::Ack { .. }), "got {resp:?}");
     assert!(broadcast.is_some());
 
     let (stored, _) = db::get_snapshot_with_vv(&db, "v", "recreated.md")
@@ -1300,6 +1306,7 @@ async fn test_doc_create_replace_on_both_rows_merges_and_drops_stale_tombstone()
     let snapshot = doc.export(ExportMode::Snapshot).unwrap();
 
     let create = rmp_serde::to_vec_named(&msg::ClientMsg::DocCreate {
+        request_id: None,
         doc_uuid: "both.md".into(),
         snapshot,
         peer_id: "peer-new".into(),
@@ -1307,7 +1314,7 @@ async fn test_doc_create_replace_on_both_rows_merges_and_drops_stale_tombstone()
     })
     .unwrap();
     let (resp, broadcast) = process_message(&create, &db, "v", 1, &doc_locks).await;
-    assert!(matches!(resp, msg::ServerMsg::Ack), "got {resp:?}");
+    assert!(matches!(resp, msg::ServerMsg::Ack { .. }), "got {resp:?}");
     assert!(broadcast.is_some());
     assert!(!db::is_tombstoned(&db, "v", "both.md").await.unwrap());
 
@@ -1376,6 +1383,7 @@ async fn test_doc_delete_vs_sync_push_race() {
         seed.get_text("text").insert(0, "seed").unwrap();
         let seed_snapshot = seed.export(ExportMode::Snapshot).unwrap();
         let create_msg = rmp_serde::to_vec_named(&msg::ClientMsg::DocCreate {
+            request_id: None,
             doc_uuid: doc_uuid.clone(),
             snapshot: seed_snapshot.clone(),
             peer_id: "peer-seed".into(),
@@ -1383,7 +1391,10 @@ async fn test_doc_delete_vs_sync_push_race() {
         })
         .unwrap();
         let (resp, _) = process_message(&create_msg, &db, "v", 1, &doc_locks).await;
-        assert!(matches!(resp, msg::ServerMsg::Ack), "seed create failed");
+        assert!(
+            matches!(resp, msg::ServerMsg::Ack { .. }),
+            "seed create failed"
+        );
 
         // Build a fresh delta from the seed state representing a concurrent edit.
         let client = LoroDoc::new();
@@ -1393,12 +1404,16 @@ async fn test_doc_delete_vs_sync_push_race() {
         let delta = client.export(ExportMode::updates(&base_vv)).unwrap();
 
         let push_bytes = rmp_serde::to_vec_named(&msg::ClientMsg::SyncPush {
+            request_id: None,
             doc_uuid: doc_uuid.clone(),
             delta,
             peer_id: "peer-push".into(),
         })
         .unwrap();
         let delete_bytes = rmp_serde::to_vec_named(&msg::ClientMsg::DocDelete {
+            request_id: None,
+            expected_incarnation: None,
+            intent_id: None,
             doc_uuid: doc_uuid.clone(),
             peer_id: "peer-del".into(),
         })
@@ -1487,6 +1502,7 @@ async fn test_doc_create_disjoint_history_refused() {
     a.set_peer_id(1).unwrap();
     a.get_text("text").insert(0, "server text").unwrap();
     let create = rmp_serde::to_vec_named(&msg::ClientMsg::DocCreate {
+        request_id: None,
         doc_uuid: "c.md".into(),
         snapshot: a.export(ExportMode::Snapshot).unwrap(),
         peer_id: "1".into(),
@@ -1494,7 +1510,7 @@ async fn test_doc_create_disjoint_history_refused() {
     })
     .unwrap();
     let (resp, _) = process_message(&create, &db, "v", 1, &doc_locks).await;
-    assert!(matches!(resp, msg::ServerMsg::Ack));
+    assert!(matches!(resp, msg::ServerMsg::Ack { .. }));
     let before = db::get_snapshot_with_vv(&db, "v", "c.md")
         .await
         .unwrap()
@@ -1504,6 +1520,7 @@ async fn test_doc_create_disjoint_history_refused() {
     b.set_peer_id(2).unwrap();
     b.get_text("text").insert(0, "local text").unwrap();
     let create = rmp_serde::to_vec_named(&msg::ClientMsg::DocCreate {
+        request_id: None,
         doc_uuid: "c.md".into(),
         snapshot: b.export(ExportMode::Snapshot).unwrap(),
         peer_id: "2".into(),
@@ -1540,6 +1557,7 @@ async fn test_sync_push_disjoint_history_refused() {
     a.set_peer_id(1).unwrap();
     a.get_text("text").insert(0, "server text").unwrap();
     let create = rmp_serde::to_vec_named(&msg::ClientMsg::DocCreate {
+        request_id: None,
         doc_uuid: "c.md".into(),
         snapshot: a.export(ExportMode::Snapshot).unwrap(),
         peer_id: "1".into(),
@@ -1547,7 +1565,7 @@ async fn test_sync_push_disjoint_history_refused() {
     })
     .unwrap();
     let (resp, _) = process_message(&create, &db, "v", 1, &doc_locks).await;
-    assert!(matches!(resp, msg::ServerMsg::Ack));
+    assert!(matches!(resp, msg::ServerMsg::Ack { .. }));
     let before = db::get_snapshot_with_vv(&db, "v", "c.md")
         .await
         .unwrap()
@@ -1557,6 +1575,7 @@ async fn test_sync_push_disjoint_history_refused() {
     b.set_peer_id(2).unwrap();
     b.get_text("text").insert(0, "local text").unwrap();
     let push = rmp_serde::to_vec_named(&msg::ClientMsg::SyncPush {
+        request_id: None,
         doc_uuid: "c.md".into(),
         delta: b
             .export(ExportMode::updates(&VersionVector::new()))
@@ -1595,6 +1614,7 @@ async fn test_sync_push_after_adopting_snapshot_merges() {
     a.get_text("text").insert(0, "server text").unwrap();
     let snapshot = a.export(ExportMode::Snapshot).unwrap();
     let create = rmp_serde::to_vec_named(&msg::ClientMsg::DocCreate {
+        request_id: None,
         doc_uuid: "c.md".into(),
         snapshot: snapshot.clone(),
         peer_id: "1".into(),
@@ -1602,20 +1622,21 @@ async fn test_sync_push_after_adopting_snapshot_merges() {
     })
     .unwrap();
     let (resp, _) = process_message(&create, &db, "v", 1, &doc_locks).await;
-    assert!(matches!(resp, msg::ServerMsg::Ack));
+    assert!(matches!(resp, msg::ServerMsg::Ack { .. }));
     let b = LoroDoc::new();
     b.set_peer_id(2).unwrap();
     b.import(&snapshot).unwrap();
     let vv0 = b.oplog_vv();
     b.get_text("text").insert(11, " +B").unwrap();
     let push = rmp_serde::to_vec_named(&msg::ClientMsg::SyncPush {
+        request_id: None,
         doc_uuid: "c.md".into(),
         delta: b.export(ExportMode::updates(&vv0)).unwrap(),
         peer_id: "2".into(),
     })
     .unwrap();
     let (resp, broadcast) = process_message(&push, &db, "v", 2, &doc_locks).await;
-    assert!(matches!(resp, msg::ServerMsg::Ack), "{resp:?}");
+    assert!(matches!(resp, msg::ServerMsg::Ack { .. }), "{resp:?}");
     assert!(matches!(broadcast, Some(BroadcastEvent::Delta { .. })));
     let (snapshot, _) = db::get_snapshot_with_vv(&db, "v", "c.md")
         .await
@@ -1637,6 +1658,7 @@ async fn test_sync_push_no_stored_doc_unchanged() {
     a.set_peer_id(1).unwrap();
     a.get_text("text").insert(0, "new text").unwrap();
     let push = rmp_serde::to_vec_named(&msg::ClientMsg::SyncPush {
+        request_id: None,
         doc_uuid: "c.md".into(),
         delta: a
             .export(ExportMode::updates(&VersionVector::new()))
@@ -1645,7 +1667,7 @@ async fn test_sync_push_no_stored_doc_unchanged() {
     })
     .unwrap();
     let (resp, broadcast) = process_message(&push, &db, "v", 1, &doc_locks).await;
-    assert!(matches!(resp, msg::ServerMsg::Ack));
+    assert!(matches!(resp, msg::ServerMsg::Ack { .. }));
     assert!(matches!(broadcast, Some(BroadcastEvent::Delta { .. })));
     let (snapshot, _) = db::get_snapshot_with_vv(&db, "v", "c.md")
         .await
@@ -1667,6 +1689,7 @@ async fn test_sync_push_same_peer_incremental_unchanged() {
     a.set_peer_id(1).unwrap();
     a.get_text("text").insert(0, "server text").unwrap();
     let create = rmp_serde::to_vec_named(&msg::ClientMsg::DocCreate {
+        request_id: None,
         doc_uuid: "c.md".into(),
         snapshot: a.export(ExportMode::Snapshot).unwrap(),
         peer_id: "1".into(),
@@ -1674,20 +1697,21 @@ async fn test_sync_push_same_peer_incremental_unchanged() {
     })
     .unwrap();
     let (resp, _) = process_message(&create, &db, "v", 1, &doc_locks).await;
-    assert!(matches!(resp, msg::ServerMsg::Ack));
+    assert!(matches!(resp, msg::ServerMsg::Ack { .. }));
     let vv0 = a.oplog_vv();
     a.get_text("text").insert(11, " +A").unwrap();
     let delta = a.export(ExportMode::updates(&vv0)).unwrap();
     let empty = a.export(ExportMode::updates(&a.oplog_vv())).unwrap();
     for delta in [delta, empty] {
         let push = rmp_serde::to_vec_named(&msg::ClientMsg::SyncPush {
+            request_id: None,
             doc_uuid: "c.md".into(),
             delta,
             peer_id: "1".into(),
         })
         .unwrap();
         let (resp, broadcast) = process_message(&push, &db, "v", 1, &doc_locks).await;
-        assert!(matches!(resp, msg::ServerMsg::Ack), "{resp:?}");
+        assert!(matches!(resp, msg::ServerMsg::Ack { .. }), "{resp:?}");
         assert!(matches!(broadcast, Some(BroadcastEvent::Delta { .. })));
     }
     let (snapshot, _) = db::get_snapshot_with_vv(&db, "v", "c.md")
@@ -1715,6 +1739,7 @@ async fn test_doc_create_corrupt_stored_vv_refused() {
     let b = LoroDoc::new();
     b.get_text("text").insert(0, "local text").unwrap();
     let create = rmp_serde::to_vec_named(&msg::ClientMsg::DocCreate {
+        request_id: None,
         doc_uuid: "c.md".into(),
         snapshot: b.export(ExportMode::Snapshot).unwrap(),
         peer_id: "2".into(),
@@ -1745,6 +1770,7 @@ async fn test_doc_create_shared_history_merges() {
     a.get_text("text").insert(0, "server text").unwrap();
     let a_snapshot = a.export(ExportMode::Snapshot).unwrap();
     let create = rmp_serde::to_vec_named(&msg::ClientMsg::DocCreate {
+        request_id: None,
         doc_uuid: "c.md".into(),
         snapshot: a_snapshot.clone(),
         peer_id: "1".into(),
@@ -1752,13 +1778,14 @@ async fn test_doc_create_shared_history_merges() {
     })
     .unwrap();
     let (resp, _) = process_message(&create, &db, "v", 1, &doc_locks).await;
-    assert!(matches!(resp, msg::ServerMsg::Ack));
+    assert!(matches!(resp, msg::ServerMsg::Ack { .. }));
 
     let b = LoroDoc::new();
     b.set_peer_id(2).unwrap();
     b.import(&a_snapshot).unwrap();
     b.get_text("text").insert(11, " +B").unwrap();
     let create = rmp_serde::to_vec_named(&msg::ClientMsg::DocCreate {
+        request_id: None,
         doc_uuid: "c.md".into(),
         snapshot: b.export(ExportMode::Snapshot).unwrap(),
         peer_id: "2".into(),
@@ -1766,7 +1793,7 @@ async fn test_doc_create_shared_history_merges() {
     })
     .unwrap();
     let (resp, broadcast) = process_message(&create, &db, "v", 2, &doc_locks).await;
-    assert!(matches!(resp, msg::ServerMsg::Ack));
+    assert!(matches!(resp, msg::ServerMsg::Ack { .. }));
     assert!(broadcast.is_some());
     let (snapshot, _) = db::get_snapshot_with_vv(&db, "v", "c.md")
         .await
@@ -1807,6 +1834,7 @@ async fn test_doc_create_replace_tombstone_on_live_doc_merges() {
     let client_snap = client.export(ExportMode::Snapshot).unwrap();
 
     let create_msg = rmp_serde::to_vec_named(&msg::ClientMsg::DocCreate {
+        request_id: None,
         doc_uuid: "live.md".into(),
         snapshot: client_snap,
         peer_id: "peer-c".into(),
@@ -1815,7 +1843,7 @@ async fn test_doc_create_replace_tombstone_on_live_doc_merges() {
     .unwrap();
 
     let (resp, _) = process_message(&create_msg, &db, "v", 1, &doc_locks).await;
-    assert!(matches!(resp, msg::ServerMsg::Ack));
+    assert!(matches!(resp, msg::ServerMsg::Ack { .. }));
 
     let (stored, _) = db::get_snapshot_with_vv(&db, "v", "live.md")
         .await
@@ -1848,6 +1876,7 @@ async fn test_doc_create_replace_tombstone_keeps_tombstone_on_bad_snapshot() {
         .unwrap();
 
     let create_msg = rmp_serde::to_vec_named(&msg::ClientMsg::DocCreate {
+        request_id: None,
         doc_uuid: "dead.md".into(),
         snapshot: b"not-a-valid-loro-snapshot".to_vec(),
         peer_id: "peer-bad".into(),
@@ -1883,7 +1912,7 @@ async fn test_delete_doc_and_tombstone_atomic() {
         .await
         .unwrap();
 
-    db::delete_doc_and_tombstone(&db, "v", "d", "peer-x")
+    db::delete_doc_guarded(&db, "v", "d", "peer-x", None)
         .await
         .unwrap();
 
@@ -1904,6 +1933,7 @@ fn test_oversized_frame_error_message_shape() {
     let n = 50 * 1024 * 1024 + 1;
     let err = msg::ServerMsg::Error {
         code: "frame_too_large".into(),
+        request_id: None,
         message: format!("frame too large ({n} bytes, limit 50 MiB) — document not synced"),
     };
     let bytes = rmp_serde::to_vec_named(&err).expect("serialize");
@@ -1953,7 +1983,7 @@ async fn test_migration_005_adds_tombstone_content_hash_and_preserves_nulls() {
     }
 
     let db = db::open_db(path.to_str().unwrap()).await.unwrap();
-    assert_eq!(scalar::<i64>(&db, "PRAGMA user_version").await, 5);
+    assert_eq!(scalar::<i64>(&db, "PRAGMA user_version").await, 6);
     let names: Vec<String> = {
         let conn = db.lock().await;
         let mut stmt = conn.prepare("PRAGMA table_info(tombstones)").unwrap();
@@ -1991,10 +2021,12 @@ async fn test_delete_captures_fnv_content_hash() {
         .await
         .unwrap();
 
-    let returned = db::delete_doc_and_tombstone(&db, "v", "note.md", "peer-x")
+    let returned = db::delete_doc_guarded(&db, "v", "note.md", "peer-x", None)
         .await
         .unwrap();
-    assert_eq!(returned.as_deref(), Some("a6a9b25f2a464e61"));
+    assert!(
+        matches!(returned, db::DeleteOutcome::Deleted { content_hash: Some(hash), .. } if hash == "a6a9b25f2a464e61")
+    );
 
     let hashes = db::list_tombstones_with_hash(&db, "v").await.unwrap();
     assert_eq!(hashes.len(), 1);
@@ -2005,10 +2037,13 @@ async fn test_delete_captures_fnv_content_hash() {
 #[tokio::test]
 async fn test_delete_without_document_row_stores_null_hash() {
     let db = test_db().await;
-    let returned = db::delete_doc_and_tombstone(&db, "v", "ghost.md", "peer-x")
+    let returned = db::delete_doc_guarded(&db, "v", "ghost.md", "peer-x", None)
         .await
         .unwrap();
-    assert_eq!(returned, None);
+    assert_eq!(
+        returned,
+        db::DeleteOutcome::IdempotentNoLive { content_hash: None }
+    );
 
     let hashes = db::list_tombstones_with_hash(&db, "v").await.unwrap();
     assert_eq!(hashes.len(), 1);
@@ -2031,7 +2066,7 @@ async fn test_replayed_delete_preserves_captured_hash() {
         .await
         .unwrap();
 
-    db::delete_doc_and_tombstone(&db, "v", "note.md", "peer-1")
+    db::delete_doc_guarded(&db, "v", "note.md", "peer-1", None)
         .await
         .unwrap();
     let first = db::list_tombstones_with_hash(&db, "v").await.unwrap();
@@ -2044,10 +2079,15 @@ async fn test_replayed_delete_preserves_captured_hash() {
     .await;
 
     // Replay: document row is already gone — hash must survive.
-    let replayed = db::delete_doc_and_tombstone(&db, "v", "note.md", "peer-2")
+    let replayed = db::delete_doc_guarded(&db, "v", "note.md", "peer-2", None)
         .await
         .unwrap();
-    assert_eq!(replayed.as_deref(), Some("a6a9b25f2a464e61"));
+    assert_eq!(
+        replayed,
+        db::DeleteOutcome::IdempotentNoLive {
+            content_hash: Some("a6a9b25f2a464e61".into())
+        }
+    );
 
     let deleted_by: String = scalar(
         &db,
@@ -2086,10 +2126,10 @@ async fn test_replayed_delete_preserves_captured_hash() {
 #[tokio::test]
 async fn test_replayed_delete_never_existed_hash_stays_null() {
     let db = test_db().await;
-    db::delete_doc_and_tombstone(&db, "v", "ghost.md", "peer-1")
+    db::delete_doc_guarded(&db, "v", "ghost.md", "peer-1", None)
         .await
         .unwrap();
-    db::delete_doc_and_tombstone(&db, "v", "ghost.md", "peer-2")
+    db::delete_doc_guarded(&db, "v", "ghost.md", "peer-2", None)
         .await
         .unwrap();
 
@@ -2118,7 +2158,7 @@ async fn test_doc_list_tombstone_hashes_and_null_roundtrip() {
     db::store_snapshot_with_vv(&db, "v", "a.md", &snapshot, &vv)
         .await
         .unwrap();
-    db::delete_doc_and_tombstone(&db, "v", "a.md", "peer")
+    db::delete_doc_guarded(&db, "v", "a.md", "peer", None)
         .await
         .unwrap();
     // Pre-migration-style row: tombstone insert without a captured hash.
@@ -2160,7 +2200,7 @@ async fn test_delete_recreate_delete_stores_second_version_hash() {
     db::store_snapshot_with_vv(&db, "v", "same.md", &snap1, &vv1)
         .await
         .unwrap();
-    db::delete_doc_and_tombstone(&db, "v", "same.md", "peer-1")
+    db::delete_doc_guarded(&db, "v", "same.md", "peer-1", None)
         .await
         .unwrap();
     let first = db::list_tombstones_with_hash(&db, "v").await.unwrap();
@@ -2172,6 +2212,7 @@ async fn test_delete_recreate_delete_stores_second_version_hash() {
         .unwrap();
     let snap2 = doc2.export(ExportMode::Snapshot).unwrap();
     let create = rmp_serde::to_vec_named(&msg::ClientMsg::DocCreate {
+        request_id: None,
         doc_uuid: "same.md".into(),
         snapshot: snap2,
         peer_id: "peer-2".into(),
@@ -2179,16 +2220,19 @@ async fn test_delete_recreate_delete_stores_second_version_hash() {
     })
     .unwrap();
     let (resp, _) = process_message(&create, &db, "v", 1, &doc_locks).await;
-    assert!(matches!(resp, msg::ServerMsg::Ack));
+    assert!(matches!(resp, msg::ServerMsg::Ack { .. }));
     assert!(!db::is_tombstoned(&db, "v", "same.md").await.unwrap());
 
     let delete = rmp_serde::to_vec_named(&msg::ClientMsg::DocDelete {
+        request_id: None,
+        expected_incarnation: None,
+        intent_id: None,
         doc_uuid: "same.md".into(),
         peer_id: "peer-2".into(),
     })
     .unwrap();
     let (resp, _) = process_message(&delete, &db, "v", 2, &doc_locks).await;
-    assert!(matches!(resp, msg::ServerMsg::Ack));
+    assert!(matches!(resp, msg::ServerMsg::Ack { .. }));
 
     let second = db::list_tombstones_with_hash(&db, "v").await.unwrap();
     assert_eq!(second.len(), 1);
@@ -2211,12 +2255,15 @@ async fn test_doc_delete_broadcast_carries_captured_and_coalesce_hash() {
         .unwrap();
 
     let delete = rmp_serde::to_vec_named(&msg::ClientMsg::DocDelete {
+        request_id: None,
+        expected_incarnation: None,
+        intent_id: None,
         doc_uuid: "note.md".into(),
         peer_id: "peer-1".into(),
     })
     .unwrap();
     let (resp, broadcast) = process_message(&delete, &db, "v", 1, &doc_locks).await;
-    assert!(matches!(resp, msg::ServerMsg::Ack));
+    assert!(matches!(resp, msg::ServerMsg::Ack { .. }));
     match broadcast {
         Some(BroadcastEvent::Delete {
             doc_uuid,
@@ -2231,7 +2278,7 @@ async fn test_doc_delete_broadcast_carries_captured_and_coalesce_hash() {
 
     // Re-delete: document row is gone — COALESCE must retain the captured hash.
     let (resp, broadcast) = process_message(&delete, &db, "v", 2, &doc_locks).await;
-    assert!(matches!(resp, msg::ServerMsg::Ack));
+    assert!(matches!(resp, msg::ServerMsg::Ack { .. }));
     match broadcast {
         Some(BroadcastEvent::Delete {
             doc_uuid,
@@ -2289,12 +2336,14 @@ async fn test_oversized_doc_uuid_rejected_in_every_variant() {
         })
         .unwrap(),
         rmp_serde::to_vec_named(&msg::ClientMsg::SyncPush {
+            request_id: None,
             doc_uuid: too_long.clone(),
             delta: snapshot.clone(),
             peer_id: "p".into(),
         })
         .unwrap(),
         rmp_serde::to_vec_named(&msg::ClientMsg::DocCreate {
+            request_id: None,
             doc_uuid: too_long.clone(),
             snapshot: snapshot.clone(),
             peer_id: "p".into(),
@@ -2302,6 +2351,9 @@ async fn test_oversized_doc_uuid_rejected_in_every_variant() {
         })
         .unwrap(),
         rmp_serde::to_vec_named(&msg::ClientMsg::DocDelete {
+            request_id: None,
+            expected_incarnation: None,
+            intent_id: None,
             doc_uuid: too_long.clone(),
             peer_id: "p".into(),
         })
@@ -2340,6 +2392,7 @@ async fn test_doc_uuid_and_peer_id_boundaries() {
 
     // 1024 bytes doc_uuid + 128 bytes peer_id: accepted.
     let create = rmp_serde::to_vec_named(&msg::ClientMsg::DocCreate {
+        request_id: None,
         doc_uuid: "a".repeat(1024),
         snapshot: snapshot.clone(),
         peer_id: "p".repeat(128),
@@ -2347,11 +2400,12 @@ async fn test_doc_uuid_and_peer_id_boundaries() {
     })
     .unwrap();
     let (resp, broadcast) = process_message(&create, &db, "v", 1, &doc_locks).await;
-    assert!(matches!(resp, msg::ServerMsg::Ack), "got {resp:?}");
+    assert!(matches!(resp, msg::ServerMsg::Ack { .. }), "got {resp:?}");
     assert!(broadcast.is_some());
 
     // 129-byte peer_id: rejected.
     let bad_peer = rmp_serde::to_vec_named(&msg::ClientMsg::DocCreate {
+        request_id: None,
         doc_uuid: "b.md".into(),
         snapshot: snapshot.clone(),
         peer_id: "p".repeat(129),

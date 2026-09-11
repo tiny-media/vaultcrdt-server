@@ -29,7 +29,7 @@ impl Db {
 }
 
 /// Migrations are compiled in; the `migrations/` directory stays the source of
-/// truth. note: five `include_str!` lines beat pulling in `include_dir`
+/// truth. note: six `include_str!` lines beat pulling in `include_dir`
 /// via the `from-directory` feature; switch when migrations get numerous.
 fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
@@ -38,6 +38,7 @@ fn migrations() -> Migrations<'static> {
         M::up(include_str!("../migrations/003_invites_device_keys.sql")),
         M::up(include_str!("../migrations/004_blob_lane.sql")),
         M::up(include_str!("../migrations/005_tombstone_content_hash.sql")),
+        M::up(include_str!("../migrations/006_incarnation.sql")),
     ])
 }
 
@@ -111,6 +112,8 @@ pub struct DocEntry {
     pub updated_at: String,
     #[serde(with = "serde_bytes")]
     pub server_vv: Vec<u8>,
+    #[serde(default)]
+    pub incarnation: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -246,23 +249,63 @@ pub async fn verify_vault(db: &Db, vault_id: &str, api_key: &str) -> Result<bool
 
 // ── Document queries ─────────────────────────────────────────────────────────
 
+/// Allocate only inside the transaction that establishes the live row.
+fn allocate_incarnation(
+    tx: &rusqlite::Transaction<'_>,
+    vault_id: &str,
+) -> Result<i64, ServerError> {
+    let next: i64 = tx
+        .query_row(
+            "INSERT INTO vault_incarnation (vault_id, next_incarnation) VALUES (?, 2)
+         ON CONFLICT(vault_id) DO UPDATE SET
+           next_incarnation = vault_incarnation.next_incarnation + 1
+           WHERE vault_incarnation.next_incarnation < 9223372036854775807
+         RETURNING next_incarnation",
+            params![vault_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => {
+                ServerError::Db(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+                    Some("incarnation space exhausted".into()),
+                ))
+            }
+            other => ServerError::Db(other),
+        })?;
+    Ok(next - 1)
+}
+
 pub async fn store_snapshot_with_vv(
     db: &Db,
     vault_id: &str,
     doc_uuid: &str,
     snapshot: &[u8],
     vv_blob: &[u8],
-) -> Result<(), ServerError> {
-    let conn = db.lock().await;
-    conn.execute(
-        "INSERT INTO documents (vault_id, doc_uuid, snapshot_blob, vv_blob) VALUES (?, ?, ?, ?) \
+) -> Result<i64, ServerError> {
+    let mut conn = db.lock().await;
+    let tx = conn.transaction()?;
+    let existing: Option<i64> = tx
+        .query_row(
+            "SELECT incarnation FROM documents WHERE vault_id = ? AND doc_uuid = ?",
+            params![vault_id, doc_uuid],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let incarnation = match existing {
+        Some(token) => token,
+        None => allocate_incarnation(&tx, vault_id)?,
+    };
+    tx.execute(
+        "INSERT INTO documents (vault_id, doc_uuid, snapshot_blob, vv_blob, incarnation) VALUES (?, ?, ?, ?, ?) \
          ON CONFLICT(vault_id, doc_uuid) DO UPDATE SET \
            snapshot_blob = excluded.snapshot_blob, \
            vv_blob = excluded.vv_blob, \
            updated_at = datetime('now')",
-        params![vault_id, doc_uuid, snapshot, vv_blob],
+        params![vault_id, doc_uuid, snapshot, vv_blob, incarnation],
     )?;
-    Ok(())
+    tx.commit()?;
+    Ok(incarnation)
 }
 
 /// Atomically store a snapshot and remove the path's tombstone.
@@ -276,23 +319,41 @@ pub async fn store_snapshot_replacing_tombstone(
     doc_uuid: &str,
     snapshot: &[u8],
     vv_blob: &[u8],
-) -> Result<(), ServerError> {
+) -> Result<i64, ServerError> {
     let mut conn = db.lock().await;
     let tx = conn.transaction()?;
+    let incarnation = allocate_incarnation(&tx, vault_id)?;
     tx.execute(
-        "INSERT INTO documents (vault_id, doc_uuid, snapshot_blob, vv_blob) VALUES (?, ?, ?, ?) \
+        "INSERT INTO documents (vault_id, doc_uuid, snapshot_blob, vv_blob, incarnation) VALUES (?, ?, ?, ?, ?) \
          ON CONFLICT(vault_id, doc_uuid) DO UPDATE SET \
            snapshot_blob = excluded.snapshot_blob, \
            vv_blob = excluded.vv_blob, \
+           incarnation = excluded.incarnation, \
            updated_at = datetime('now')",
-        params![vault_id, doc_uuid, snapshot, vv_blob],
+        params![vault_id, doc_uuid, snapshot, vv_blob, incarnation],
     )?;
     tx.execute(
         "DELETE FROM tombstones WHERE vault_id = ? AND doc_uuid = ?",
         params![vault_id, doc_uuid],
     )?;
     tx.commit()?;
-    Ok(())
+    Ok(incarnation)
+}
+
+/// Read the snapshot and its incarnation together for SyncStart's delete proof.
+pub(crate) async fn get_snapshot_with_incarnation(
+    db: &Db,
+    vault_id: &str,
+    doc_uuid: &str,
+) -> Result<Option<(Vec<u8>, i64)>, ServerError> {
+    let conn = db.lock().await;
+    Ok(conn
+        .query_row(
+            "SELECT snapshot_blob, incarnation FROM documents WHERE vault_id = ? AND doc_uuid = ?",
+            params![vault_id, doc_uuid],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?)
 }
 
 pub async fn get_snapshot_with_vv(
@@ -314,20 +375,21 @@ pub async fn get_snapshot_with_vv(
 pub async fn list_docs_with_vv(db: &Db, vault_id: &str) -> Result<Vec<DocEntry>, ServerError> {
     let conn = db.lock().await;
     let mut stmt = conn.prepare(
-        "SELECT doc_uuid, updated_at, vv_blob FROM documents WHERE vault_id = ? ORDER BY doc_uuid",
+        "SELECT doc_uuid, updated_at, vv_blob, incarnation FROM documents WHERE vault_id = ? ORDER BY doc_uuid",
     )?;
     let rows = stmt
         .query_map(params![vault_id], |r| {
             let doc_uuid: String = r.get(0)?;
             let updated_at: String = r.get(1)?;
             let db_vv: Vec<u8> = r.get(2)?;
-            Ok((doc_uuid, updated_at, db_vv))
+            let incarnation: i64 = r.get(3)?;
+            Ok((doc_uuid, updated_at, db_vv, incarnation))
         })?
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(rows
         .into_iter()
-        .map(|(doc_uuid, updated_at, db_vv)| {
+        .map(|(doc_uuid, updated_at, db_vv, incarnation)| {
             // Convert from DB binary encoding to JSON bytes (same format as sync_delta)
             let json_vv = match crate::vv_serde::vv_from_db_bytes(&db_vv) {
                 Ok(vv) => crate::vv_serde::vv_to_json_bytes(&vv),
@@ -339,6 +401,7 @@ pub async fn list_docs_with_vv(db: &Db, vault_id: &str) -> Result<Vec<DocEntry>,
                 doc_uuid,
                 updated_at,
                 server_vv: json_vv,
+                incarnation: Some(incarnation),
             }
         })
         .collect())
@@ -433,13 +496,20 @@ fn content_hash_from_snapshot_blob(snapshot_blob: &[u8]) -> Option<String> {
     ))
 }
 
-/// Atomically delete the document row and insert/update its tombstone.
-///
-/// Captures `content_hash` from the snapshot *before* the row is deleted.
-/// Returns the hash stored on the tombstone after `COALESCE` — the captured
-/// value on first delete, or the already-stored hash on a re-delete whose
-/// document row is gone. `None` if there is no document row (and no prior
-/// hash) or text extraction fails; the delete itself still succeeds.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DeleteOutcome {
+    /// Deleted a live row; the tombstone records its incarnation.
+    Deleted {
+        content_hash: Option<String>,
+        incarnation: i64,
+    },
+    /// No live row; retain any existing tombstone hash and incarnation.
+    IdempotentNoLive { content_hash: Option<String> },
+    /// No mutation. Zero denotes no live row.
+    Rejected { live_incarnation: i64 },
+}
+
+/// Decide and delete in one transaction, including legacy unconditional deletes.
 ///
 /// A replayed/late delete for an already-tombstoned path carries no snapshot
 /// (the document row is gone). `ON CONFLICT` therefore uses
@@ -448,35 +518,43 @@ fn content_hash_from_snapshot_blob(snapshot_blob: &[u8]) -> Option<String> {
 /// that hash is the proof basis for client keep-guards (`tombstone_hashes`
 /// in `doc_list` and `content_hash` on `doc_deleted`). Observed 2026-09-07 T2:
 /// a replayed `doc_delete` overwrote a valid captured hash with NULL.
-pub async fn delete_doc_and_tombstone(
+pub async fn delete_doc_guarded(
     db: &Db,
     vault_id: &str,
     doc_uuid: &str,
     deleted_by: &str,
-) -> Result<Option<String>, ServerError> {
+    expected: Option<i64>,
+) -> Result<DeleteOutcome, ServerError> {
     let mut conn = db.lock().await;
     let tx = conn.transaction()?;
-    let snapshot_blob: Option<Vec<u8>> = tx
+    let live: Option<(Vec<u8>, i64)> = tx
         .query_row(
-            "SELECT snapshot_blob FROM documents WHERE vault_id = ? AND doc_uuid = ?",
+            "SELECT snapshot_blob, incarnation FROM documents WHERE vault_id = ? AND doc_uuid = ?",
             params![vault_id, doc_uuid],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
-    let content_hash = snapshot_blob
-        .as_deref()
-        .and_then(content_hash_from_snapshot_blob);
+    let incarnation = live.as_ref().map(|(_, token)| *token);
+    let live_incarnation = incarnation.unwrap_or(0);
+    if expected.is_some_and(|token| token != live_incarnation) {
+        tx.commit()?;
+        return Ok(DeleteOutcome::Rejected { live_incarnation });
+    }
+    let content_hash = live
+        .as_ref()
+        .and_then(|(snapshot, _)| content_hash_from_snapshot_blob(snapshot));
     tx.execute(
         "DELETE FROM documents WHERE vault_id = ? AND doc_uuid = ?",
         params![vault_id, doc_uuid],
     )?;
     tx.execute(
-        "INSERT INTO tombstones (vault_id, doc_uuid, deleted_by, content_hash) VALUES (?, ?, ?, ?) \
+        "INSERT INTO tombstones (vault_id, doc_uuid, deleted_by, content_hash, incarnation) VALUES (?, ?, ?, ?, COALESCE(?, 1)) \
          ON CONFLICT(vault_id, doc_uuid) DO UPDATE SET \
            deleted_by = excluded.deleted_by, \
            deleted_at = datetime('now'), \
-           content_hash = COALESCE(excluded.content_hash, tombstones.content_hash)",
-        params![vault_id, doc_uuid, deleted_by, content_hash],
+           content_hash = COALESCE(excluded.content_hash, tombstones.content_hash), \
+           incarnation = COALESCE(?, tombstones.incarnation)",
+        params![vault_id, doc_uuid, deleted_by, content_hash, incarnation, incarnation],
     )?;
     let stored_hash: Option<String> = tx.query_row(
         "SELECT content_hash FROM tombstones WHERE vault_id = ? AND doc_uuid = ?",
@@ -484,7 +562,15 @@ pub async fn delete_doc_and_tombstone(
         |r| r.get(0),
     )?;
     tx.commit()?;
-    Ok(stored_hash)
+    Ok(match incarnation {
+        Some(incarnation) => DeleteOutcome::Deleted {
+            content_hash: stored_hash,
+            incarnation,
+        },
+        None => DeleteOutcome::IdempotentNoLive {
+            content_hash: stored_hash,
+        },
+    })
 }
 
 // ── Stats queries ────────────────────────────────────────────────────────────

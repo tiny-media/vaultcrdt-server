@@ -35,6 +35,9 @@ pub const MAX_DOC_UUID_BYTES: usize = 1024;
 /// Maximum UTF-8 byte length of a client-supplied `peer_id` / device name.
 pub const MAX_PEER_ID_BYTES: usize = 128;
 
+/// Maximum UTF-8 byte length of a request_id or intent_id.
+pub const MAX_REQUEST_ID_BYTES: usize = 128;
+
 // ── Per-document locks ──────────────────────────────────────────────────────
 
 /// Serialize read-modify-write operations per document (prevents TOCTOU races).
@@ -84,6 +87,7 @@ pub enum BroadcastEvent {
         peer_id: String,
         sender_conn_id: u64,
         server_vv: Vec<u8>,
+        incarnation: Option<i64>,
     },
     Delete {
         vault_id: String,
